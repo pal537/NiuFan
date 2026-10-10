@@ -5,18 +5,19 @@
 # This file is part of niufan, licensed under the GNU General Public
 # License version 3 or (at your option) any later version.
 # See the LICENSE file for the full text.
-"""Compile the donation QR images into a JavaScript module.
+"""Compile external donation QR images into a JavaScript module.
 
 The packaged application deliberately carries no stand-alone copy of the QR
 codes.  A file under ``app/ui/images/`` can be replaced inside the .fpk -- or
 in an already installed copy of the app -- without touching a line of code;
 inlining them as data URIs makes that a source change followed by a rebuild.
 
-The originals live in ``assets/donate/`` so they are kept in the repository
-but are never part of the packaged tree.  The generated module is committed,
-so a plain checkout builds without running this script first.
+The originals live outside the source tree.  The default location is
+``/vol1/1000/软件开发/收款码`` and can be overridden with ``NIUFAN_QR_DIR`` or
+the second command-line argument.  The generated module is committed, so a
+plain checkout still builds when that external directory is unavailable.
 
-Usage:  python3 tools/make_donate_qr.py [repo-root]
+Usage:  python3 tools/make_donate_qr.py [repo-root] [qr-source-dir]
 """
 
 from __future__ import annotations
@@ -26,10 +27,13 @@ import json
 import os
 import sys
 
-#: donation key used by donate.json -> file name under assets/donate/
-IMAGES = {"wechat": "wechat.png", "alipay": "alipay.png"}
+#: donation key used by donate.json -> accepted external file names
+IMAGES = {
+    "wechat": ("微信.jpg", "wechat.jpg", "wechat.png"),
+    "alipay": ("支付宝.jpg", "alipay.jpg", "alipay.png"),
+}
 
-ASSET_DIR = os.path.join("assets", "donate")
+DEFAULT_SOURCE_DIR = "/vol1/1000/软件开发/收款码"
 OUTPUT = os.path.join("package", "app", "ui", "donate-qr.js")
 
 MIME = {
@@ -58,13 +62,22 @@ def mime_for(path):
     return MIME.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
 
 
-def build(root):
+def find_source(source_dir, names):
+    for name in names:
+        path = os.path.join(source_dir, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def build(source_dir):
     """Return the module text, or raise ``OSError`` naming the missing file."""
     entries = []
     for key in sorted(IMAGES):
-        path = os.path.join(root, ASSET_DIR, IMAGES[key])
-        if not os.path.isfile(path):
-            raise OSError("missing %s" % os.path.relpath(path, root))
+        path = find_source(source_dir, IMAGES[key])
+        if path is None:
+            raise OSError("missing %s (%s)"
+                          % (" / ".join(IMAGES[key]), source_dir))
         with open(path, "rb") as handle:
             blob = handle.read()
         encoded = base64.b64encode(blob).decode("ascii")
@@ -79,14 +92,26 @@ def build(root):
 
 
 def main(argv):
-    if len(argv) > 1:
+    if len(argv) > 2:
         root = os.path.abspath(argv[1])
+        source_dir = os.path.abspath(argv[2])
+    elif len(argv) > 1:
+        root = os.path.abspath(argv[1])
+        source_dir = os.path.abspath(
+            os.environ.get("NIUFAN_QR_DIR", DEFAULT_SOURCE_DIR))
     else:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        source_dir = os.path.abspath(
+            os.environ.get("NIUFAN_QR_DIR", DEFAULT_SOURCE_DIR))
 
     try:
-        text = build(root)
+        text = build(source_dir)
     except OSError as exc:
+        target = os.path.join(root, OUTPUT)
+        if os.path.isfile(target):
+            print("make_donate_qr: external source unavailable (%s); "
+                  "keeping committed %s" % (exc, OUTPUT))
+            return 0
         sys.stderr.write("make_donate_qr: %s\n" % exc)
         return 1
 

@@ -2,15 +2,14 @@
 __pycache__/
 *.py[cod]
 
-# fnpack leaves the unversioned artifact behind inside the source tree before
-# build-fpk.sh renames it; only dist/ is meant to be committed.
+# fnpack leaves an unversioned artifact inside the source tree before
+# build-fpk.sh renames it.  Neither that file nor dist/ belongs in the repo.
 package/*.fpk
 
 # Release archives produced by the packaging helper
 /*.tar.gz
 /*.zip
-/dist/*.tar.gz
-/dist/*.zip
+/dist/
 
 # Editor / OS noise
 .DS_Store
@@ -21,3 +20,7 @@ Thumbs.db
 # Local scratch
 /build/
 /scratch/
+
+# Delivery notes live beside the source tree in the workspace, not in the repo.
+/交付说明.md
+/说明.md

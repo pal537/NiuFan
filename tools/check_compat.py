@@ -194,6 +194,7 @@ def main(argv=None):
         socketserver.UnixStreamServer = socketserver.TCPServer
     fancontrold = load_module("fancontrold",
                               os.path.join(server, "fancontrold.py"))
+    fandiag = load_module("fandiag", os.path.join(server, "fandiag.py"))
 
     status = 0
     workdir, temporary = pick_workdir(args.workdir, root)
@@ -206,6 +207,8 @@ def main(argv=None):
         status |= check_frontend(root, workdir)
         status |= check_identity(root)
         status |= check_config_written_by_new_version(fanconfig, workdir)
+        status |= check_diagnostics_policy(root, workdir, fancontrold,
+                                           fanconfig, fandiag)
     finally:
         if temporary:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -475,6 +478,12 @@ def check_frontend(root, workdir):
         check.case("function esc(value)" in app_js, "app.js 里仍有 esc()")
         check.case("Array.isArray(parts)" in app_js,
                    "donateFeedback() 对缺失的 feedback 字段返回空串")
+        check.case("data-driver-mode" in app_js
+                   and "driver-mode" in app_js,
+                   "检测页包含飞牛 / 软件驱动切换入口")
+        check.case("PROJECT_URL" in app_js and "QQ_GROUP" in app_js
+                   and "3pin" in app_js and "DC" in app_js,
+                   "失败提示包含 Git / QQ 和 3pin / DC 排查建议")
         return check.finish()
 
     ui = os.path.join(root, "package", "app", "ui")
@@ -560,6 +569,99 @@ def check_identity(root):
                   encoding="utf-8").read()
     check.case("niufan" not in json.loads(config)["message"],
                "打赏文案里的软件名已改为 NiuFan")
+    return check.finish()
+
+
+def check_diagnostics_policy(root, workdir, fancontrold, fanconfig, fandiag):
+    """⑧ 诊断日志（2.2.5）：路径、鉴权、脱敏与数据层都不越界。"""
+    check = Check("⑧ 诊断日志不碰数据层、不新开免鉴权入口")
+    server = os.path.join(root, "package", "app", "server")
+    package = os.path.dirname(os.path.dirname(server))
+
+    # 1. Where the reports live: var/, never etc/ (which holds the user config).
+    class Args:  # minimal stand-in for the parsed command line
+        pass
+
+    args = Args()
+    args.appdest = os.path.join(workdir, "app")
+    args.etc = os.path.join(workdir, "etc")
+    args.var = os.path.join(workdir, "var")
+    paths = fancontrold.resolve_paths(args)
+    check.case(paths["diagnostics"] == os.path.join(workdir, "var", "diagnostics"),
+               "诊断目录在 TRIM_PKGVAR 下（%s）" % paths["diagnostics"])
+    check.case(not paths["diagnostics"].startswith(paths["etc"] + os.sep),
+               "诊断文件不写进 etc/")
+    check.case(paths["config"] == os.path.join(workdir, "etc", "config.json"),
+               "配置文件路径未变（etc/config.json）")
+
+    # 2. A download may only name a report this app wrote, in this directory.
+    store = fandiag.DiagnosticStore(paths["diagnostics"], "niufan", "0.0.0")
+    name = store.create("probe")
+    check.case(store.resolve(name) is not None, "自己生成的报告能解析")
+    for bad in ("../config.json", "..%2Fconfig.json", "/etc/passwd",
+                "..\\config.json", "a/../../etc/passwd", "report.txt/../x.txt",
+                "", ".hidden.txt", "x.txt.exe"):
+        check.case(store.resolve(bad) is None, "拒绝非法文件名 %r" % bad)
+
+    # 3. Routes: under /api/ (the authenticated gateway path), with the
+    #    fail-closed check, and served as an attachment.
+    daemon = open(os.path.join(server, "fancontrold.py"),
+                  encoding="utf-8").read()
+    diagnostics_source = open(os.path.join(server, "fandiag.py"),
+                              encoding="utf-8").read()
+    for route in ("/api/diagnostics/status", "/api/diagnostics/export",
+                  "/api/diagnostics/download"):
+        check.case(route in daemon, "接口 %s 存在" % route)
+    check.case("def authorise_diagnostics" in daemon
+               and daemon.count("self.authorise_diagnostics()") == 3,
+               "三个诊断接口都走 authorise_diagnostics（fail-closed）")
+    check.case('attachment; filename=' in daemon,
+               "下载响应带 Content-Disposition: attachment")
+    check.case("TRIM_PKGVAR" in daemon and "TRIM_APPDEST" in daemon,
+               "守护进程仍从 TRIM_* 变量取路径，未硬编码")
+    check.case("collect_runtime_logs" in diagnostics_source
+               and "info.log" in diagnostics_source
+               and "runtime_logs" in daemon,
+               "诊断导出包含 info.log 与运行日志章节")
+
+    # 4. Uninstall / upgrade must not touch the reports (a reinstall keeps the
+    #    user's configuration, and a report is no different from any other
+    #    runtime artefact the user may still want to send us).
+    for script in ("uninstall_callback", "upgrade_init", "upgrade_callback",
+                   "install_callback"):
+        text = open(os.path.join(package, "cmd", script),
+                    encoding="utf-8").read()
+        check.case("diagnostics" not in text,
+                   "cmd/%s 不会删诊断日志" % script)
+    uninstall = open(os.path.join(package, "cmd", "uninstall_callback"),
+                     encoding="utf-8").read()
+    check.case("config.json" not in uninstall.replace("config.backup", ""),
+               "卸载脚本仍不删 config.json")
+    upgrade = open(os.path.join(package, "cmd", "upgrade_callback"),
+                   encoding="utf-8").read()
+    check.case("cp -f" in upgrade, "升级仍按需恢复配置")
+
+    # 5. The configuration schema is stable and the new driver preference has
+    #    a single documented default, so older configs still read cleanly.
+    schema = set(fanconfig.DEFAULT_CONFIG)
+    check.case(schema == {"version", "setup_complete", "driver_preference",
+                          "enabled", "interval",
+                          "hdd_interval", "hysteresis", "fail_safe_duty",
+                          "sources", "fans", "fingerprint", "probe"},
+               "配置顶层字段一个没多也一个没少（%s）" % sorted(schema))
+    check.case(fanconfig.CONFIG_VERSION == 1,
+               "CONFIG_VERSION 仍为 1")
+
+    # 6. The report itself carries no credential and no full serial number.
+    disk = fandiag.mask_disk_id(
+        "/dev/disk/by-id/ata-WDC_WD40EFRX-68N32N0_WD-WCC7K1234567")
+    check.case(disk is not None and "WCC7K1234567" not in disk,
+               "报告里的硬盘标识已脱敏（%s）" % disk)
+    masked = fandiag.sanitise({"password": "hunter2", "token": "abcd123456",
+                               "media_path": "/vol1/1000/photo"})
+    check.case(masked["password"] == "**已脱敏**"
+               and masked["token"] == "**已脱敏**",
+               "口令 / token 字段在报告里被抹掉")
     return check.finish()
 
 

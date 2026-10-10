@@ -5,7 +5,7 @@
 # This file is part of niufan, licensed under the GNU General Public
 # License version 3 or (at your option) any later version.
 # See the LICENSE file for the full text.
-"""Release checks for the NiuFan .fpk, shared by build-fpk.sh and build-fpk.ps1.
+"""Release checks for the NiuFan .fpk, used by build-fpk.sh.
 
 Four sub-commands; each one exits non-zero on the first problem it finds:
 
@@ -13,9 +13,11 @@ Four sub-commands; each one exits non-zero on the first problem it finds:
                and the README badge all say the same thing
     source     the packaging tree is complete, clean and still carries the
                identifiers that must never change (appname and friends)
-    stamp      normalise the modes inside a built fpk.  fnpack.exe on Windows
-               writes 0666/0777 for everything, which is not installable, so
-               the modes are rewritten and the manifest checksum re-stamped
+    stamp      normalise the modes inside a built fpk.  fnpack may write
+               0666/0777 for everything, which is not installable, so the
+               modes are rewritten and the manifest checksum re-stamped
+    sourcepkg  build <appname>-<version>-source.tar.gz/.zip from a whitelist,
+               so the source package and the tree can never drift apart
     fpk        inspect a built fpk: version, checksum, modes, no symlinks
 
 Standard library only: this also has to run on the fnOS box, which has no pip.
@@ -29,6 +31,8 @@ import os
 import re
 import sys
 import tarfile
+import tempfile
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -65,11 +69,21 @@ REQUIRED = (
     "app/ui/app.js",
     "app/ui/style.css",
     "app/ui/donate.json",
+    "app/ui/donate-qr.js",
+    "app/server/hardwareid.py",
 )
 JUNK_DIRS = ("__pycache__", "node_modules", "dist", "build", ".git",
              ".compat-work")
 JUNK_SUFFIXES = (".pyc", ".pyo", ".orig", ".rej", ".swp", ".tmp", ".fpk")
 JUNK_NAMES = (".DS_Store", "Thumbs.db", "package-lock.json", "pnpm-lock.yaml")
+QR_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+QR_IMAGE_MARKERS = ("wechat", "alipay", "微信", "支付宝")
+#: What goes into a source package.  A whitelist and not "tar the directory":
+#: dist/, 交付/, __pycache__ and anything a future tool drops into the tree stay
+#: out by construction (《通用开发规范》2.2.1).
+SOURCE_ENTRIES = (".gitattributes", ".gitignore", "CHANGELOG.md", "LICENSE",
+                  "README.en.md", "README.md", "build-fpk.sh", "docs",
+                  "package", "tools")
 PLACEHOLDERS = ("{display_name}", "{port}", "{url-path}", "{appname}",
                 "{desktop_uidir}", "your-name", "demoapp")
 TEXT_SUFFIXES = (".py", ".js", ".css", ".html", ".json", ".sh", ".md", ".txt",
@@ -131,9 +145,15 @@ def read_manifest(path):
     return fields, entries
 
 
+def is_qr_image(name):
+    lowered = name.lower()
+    return (lowered.endswith(QR_IMAGE_SUFFIXES)
+            and any(marker in lowered for marker in QR_IMAGE_MARKERS))
+
+
 def daemon_version(path):
     match = re.search(r'^VERSION\s*=\s*"([^"]+)"', read_text(path), re.M)
-    return match.group(1) if match else None
+    return match.group(1).replace("--", "-") if match else None
 
 
 def changelog_version(path):
@@ -142,8 +162,11 @@ def changelog_version(path):
 
 
 def readme_badge_version(path):
-    match = re.search(r"badge/version-([0-9][^-]*)-", read_text(path))
-    return match.group(1) if match else None
+    match = re.search(
+        r"badge/version-([0-9]+\.[0-9]+\.[0-9]+(?:--[0-9A-Za-z.]+)?)"
+        r"-orange\.svg",
+        read_text(path))
+    return match.group(1).replace("--", "-") if match else None
 
 
 def md5_file(path):
@@ -269,7 +292,7 @@ def cmd_source(args):
         check.bad("app/ui/config 无法解析：%s" % exc)
 
     # Nothing that belongs to this machine or to the previous packaging tool.
-    junk, symlinks, forbidden, placeholders = [], [], [], []
+    junk, symlinks, forbidden, placeholders, qr_images = [], [], [], [], []
     for base, dirs, files in os.walk(root):
         for name in list(dirs):
             if name in JUNK_DIRS:
@@ -284,6 +307,8 @@ def cmd_source(args):
             if name in JUNK_NAMES or name.endswith(JUNK_SUFFIXES):
                 junk.append(rel)
                 continue
+            if is_qr_image(name):
+                qr_images.append(rel)
             if not (name.endswith(TEXT_SUFFIXES) or "." not in name):
                 continue
             try:
@@ -303,6 +328,144 @@ def cmd_source(args):
                "无脚手架占位符（%s）" % (placeholders or "干净"))
     check.case(not forbidden,
                "无主机专属路径 / 内网 IP / 口令（%s）" % (forbidden or "干净"))
+    check.case(not qr_images,
+               "打包树中没有独立收款码图片（%s）" % (qr_images or "干净"))
+    return check.finish()
+
+
+# --------------------------------------------------------------------------- #
+# stamp / inspect
+# --------------------------------------------------------------------------- #
+
+
+def collect_source(root):
+    """``[(relative-name, absolute-path)]`` for the source package, sorted.
+
+    Driven by the :data:`SOURCE_ENTRIES` whitelist rather than by walking the
+    whole tree: whatever else ends up in the workspace later (build output, the
+    delivery directory, editor scratch files) can never leak into a package
+    that is handed to strangers (《通用开发规范》2.2.1).
+    """
+    items = []
+    for entry in SOURCE_ENTRIES:
+        path = os.path.join(root, entry)
+        if os.path.islink(path) or not os.path.exists(path):
+            continue
+        if os.path.isfile(path):
+            items.append((entry, path))
+            continue
+        for base, dirs, files in os.walk(path):
+            dirs[:] = sorted(
+                name for name in dirs
+                if name not in JUNK_DIRS
+                and not os.path.islink(os.path.join(base, name)))
+            for name in sorted(files):
+                full = os.path.join(base, name)
+                if os.path.islink(full) or name in JUNK_NAMES:
+                    continue
+                if name.endswith(JUNK_SUFFIXES):
+                    continue
+                items.append((os.path.relpath(full, root).replace(os.sep, "/"),
+                              full))
+    items.sort()
+    return items
+
+
+def source_package_names(root):
+    """``(appname, version, [target, ...])`` for this tree."""
+    fields, _entries = read_manifest(os.path.join(root, "package", "manifest"))
+    appname = fields.get("appname")
+    version = fields.get("version")
+    if not appname or not version:
+        raise ValueError("package/manifest 里没有 appname/version")
+    return appname, version
+
+
+def write_source_packages(root, outdir):
+    """Build ``<appname>-<version>-source.tar.gz`` and ``.zip``.
+
+    The archive root is ``<appname>/``, so unpacking yields exactly the expanded
+    source tree the delivery rules ask for next to the package.  Both files are
+    written to a temporary name and moved into place: the archive must never be
+    produced *inside* the tree it is reading (9.4), and a half-written package
+    must never be mistaken for a finished one.
+    """
+    appname, version = source_package_names(root)
+    items = collect_source(root)
+    if not items:
+        raise ValueError("源码白名单没有匹配到任何文件")
+    os.makedirs(outdir, exist_ok=True)
+
+    written = []
+    for suffix in (".tar.gz", ".zip"):
+        target = os.path.join(outdir,
+                              "%s-%s-source%s" % (appname, version, suffix))
+        handle = tempfile.NamedTemporaryFile(dir=outdir, prefix=".source-",
+                                             suffix=suffix, delete=False)
+        handle.close()
+        try:
+            if suffix == ".zip":
+                with zipfile.ZipFile(handle.name, "w",
+                                     compression=zipfile.ZIP_DEFLATED) as out:
+                    for arcname, path in items:
+                        with open(path, "rb") as source:
+                            out.writestr("%s/%s" % (appname, arcname),
+                                         source.read())
+            else:
+                with tarfile.open(handle.name, "w:gz",
+                                  format=tarfile.GNU_FORMAT) as out:
+                    for arcname, path in items:
+                        info = out.gettarinfo(
+                            path, arcname="%s/%s" % (appname, arcname))
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ""
+                        with open(path, "rb") as source:
+                            out.addfile(info, source)
+            os.replace(handle.name, target)
+        except BaseException:
+            if os.path.exists(handle.name):
+                os.unlink(handle.name)
+            raise
+        written.append(target)
+    return written
+
+
+def cmd_sourcepkg(args):
+    check = Check("源码包生成")
+    try:
+        appname, version = source_package_names(args.root)
+        paths = write_source_packages(args.root, args.outdir)
+    except (OSError, ValueError) as exc:
+        check.bad("生成失败：%s" % exc)
+        return check.finish()
+    for path in paths:
+        check.ok("%s（%d 字节）" % (os.path.basename(path),
+                                   os.path.getsize(path)))
+
+    # Reverse check, same idea as the fpk one: read the version back out of the
+    # package and compare it with the file name and the manifest.
+    with tarfile.open(paths[0]) as archive:
+        names = archive.getnames()
+        inside = "%s/package/manifest" % appname
+        check.case(inside in names, "包内有 %s" % inside)
+        text = archive.extractfile(inside).read().decode("utf-8") if \
+            inside in names else ""
+        match = re.search(r"(?m)^\s*version\s*=\s*(.*?)\s*$", text)
+        check.case(match is not None and match.group(1) == version,
+                   "包内 manifest.version = %s（文件名里的版本 %s）"
+                   % (match.group(1) if match else "?", version))
+        leaked = [name for name in names
+                  if "__pycache__" in name
+                  or name.endswith((".pyc", ".pyo", ".fpk"))
+                  or name.startswith("%s/dist/" % appname)
+                  or name.startswith("%s/交付/" % appname)]
+        check.case(not leaked,
+                   "包内没有 dist/ 交付/ __pycache__ *.pyc *.fpk（%s）"
+                   % (leaked[:3] or "干净"))
+        qr_images = [name for name in names if is_qr_image(name)]
+        check.case(not qr_images,
+                   "源码包内没有独立收款码图片（%s）"
+                   % (qr_images[:3] or "干净"))
     return check.finish()
 
 
@@ -445,6 +608,9 @@ def main(argv=None):
     sub.add_parser("versions", help="版本号交叉校验")
     sub.add_parser("source", help="打包源码树检查")
 
+    pkg_parser = sub.add_parser("sourcepkg", help="生成源码包（tar.gz + zip）")
+    pkg_parser.add_argument("outdir", help="写到哪个目录（通常是 dist/）")
+
     stamp_parser = sub.add_parser("stamp", help="归一成品 fpk 的权限位")
     stamp_parser.add_argument("fpk")
     stamp_parser.add_argument("--output", help="写到这里（默认原地重写）")
@@ -458,7 +624,8 @@ def main(argv=None):
         print("release_checks: %s 下没有 package/ 目录" % args.root, file=sys.stderr)
         return 2
     return {"versions": cmd_versions, "source": cmd_source,
-            "stamp": cmd_stamp, "fpk": cmd_fpk}[args.command](args)
+            "sourcepkg": cmd_sourcepkg, "stamp": cmd_stamp,
+            "fpk": cmd_fpk}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-x86-lightgrey.svg)](#compatibility)
 [![fnOS](https://img.shields.io/badge/fnOS-%E2%89%A51.1.3100-green.svg)](https://www.fnnas.com/)
-[![Version](https://img.shields.io/badge/version-2.0.1-orange.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.5-orange.svg)](CHANGELOG.md)
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -35,6 +35,9 @@ essentials: **temperature sources + control curves + persisted configuration**.
 |---|---|
 | 🌡️ **Whole-machine coverage** | CPU (coretemp / k10temp / PECI), GPU (amdgpu / i915 / xe / nouveau / nvidia-smi), disks (drivetemp / nvme, `smartctl` fallback), plus motherboard (SYSTIN / CPUTIN / T_SENSOR), memory (jc42 / spd5118) and ACPI thermal zones — **each with its own switch** |
 | 🔍 **Hardware wizard** | On first launch it lists **every** PWM channel the controller exposes, with live RPM and the temperature source the BIOS bound to it; a spin-up probe finds fans that were stopped |
+| 🧬 **Active hardware detection** | It no longer depends only on existing `hwmon` nodes: DMI / PCI / USB / ACPI / I2C / device-tree IDs are collected and x86 Super-I/O configuration space is probed read-only, reporting vendor, device ID, model, I/O base and available backend |
+| 🛠️ **No-hwmon fallback** | Register layouts verified for Nuvoton NCT6779/679x and ITE IT87xx can be driven through a controlled userspace backend when the fnOS kernel did not bind a driver; process locking, snapshots and restore on stop/uninstall are included |
+| 🧾 **Diagnostic log export** | One click in the hardware screen exports a snapshot of the machine it runs on: board / BIOS, CPU, GPUs, fan controllers (hwmon name, driver module, PWM channels), kernel modules, sensor readings and a **sanitised** configuration summary, as a single downloadable txt. With no controllable fan controller the same screen shows a warning and offers the export right there |
 | ⏬ **Calibration includes 0 %** | Calibration drives the fan down to 0 %, so it also reveals whether the fan supports stopping; the result is stored and shown again next time |
 | 💽 **Disks selected by identity, not position** | Disks are identified by model + serial (`/dev/disk/by-id`) rather than `sda`/`sdb`, so re-cabling or changing the boot order keeps the selection on the same physical drive |
 | 🖥️ **One source per GPU** | A single GPU is one "GPU" card; several GPUs become 显卡1 / 显卡2 … each with its own switch and its model shown inside — no more two checkboxes fighting over the same thing |
@@ -75,14 +78,15 @@ interval, hysteresis, fail-safe duty).
 
 ### From a Release
 
-1. Download `niufan-<version>.fpk` from [Releases](../../releases) (or use the copy in `dist/`)
+1. Download `niufan-<version>-<arch>-<system>.fpk` from [Releases](../../releases)
+   (the fnOS package is `niufan-2.2.5-x86-fn.fpk`)
 2. fnOS **App Center → manual install**, pick the `.fpk`, choose a volume
 3. Open **Fan Control**
 
 Or from the shell:
 
 ```bash
-sudo appcenter-cli install-fpk niufan-1.2.0.fpk -v 3   # -v is the volume index
+sudo appcenter-cli install-fpk niufan-2.2.5-x86-fn.fpk -v 3   # -v is the volume index
 sudo appcenter-cli start niufan
 ```
 
@@ -127,8 +131,12 @@ Once you are in:
 
 ## Compatibility
 
-Whether it works depends on **which controller the fans hang off, and whether its kernel
-driver is supported here**. Each driver family uses **different `pwm_enable` values** —
+Whether it works depends first on **which controller the fans hang off, and whether its
+kernel driver is supported here**. Starting with 2.2.5, NiuFan also probes the device
+ID directly. With root and `CAP_SYS_RAWIO`/`/dev/port`, NCT6779/679x and IT87xx can use a
+direct backend when no `hwmon` driver is bound. Other chips remain read-only until a
+verified register backend exists, so unknown registers are never written blindly.
+Each driver family uses **different `pwm_enable` values** —
 writing the wrong one can hand fan control back to the BIOS or disable it altogether — so
 every family has its own profile, taken from the kernel's `Documentation/hwmon/*.rst`:
 
@@ -190,25 +198,25 @@ Requires the official `fnpack` tool, which ships with fnOS at `/usr/local/bin/fn
 ```bash
 git clone https://github.com/LiuFudi/NiuFan.git
 cd NiuFan
-./build-fpk.sh                     # produces dist/niufan-<version>.fpk
+./build-fpk.sh                     # produces dist/niufan-<version>-<arch>-<system>.fpk
 ```
 
-On Windows the official `fnpack-1.2.3-windows-amd64` works too (the script fixes the mode
-bits it writes as 0666, which would otherwise leave `cmd/*` non-executable after install):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build-fpk.ps1
-```
-
-Both entry points run the same checks (`tools/release_checks.py`) and exit non-zero on the
+The build script runs the checks in `tools/release_checks.py` and exits non-zero on the
 first problem: the version is cross-checked in four places (manifest, the daemon's `VERSION`
 constant, the top CHANGELOG entry, the README badge); `__pycache__` / `*.pyc` / stale `.fpk`
-files are cleared and the inlined QR codes rebuilt; the packaging tree is checked for the
-identifiers that must never move, symlinks, scaffold placeholders and host-specific paths; the
-artifact is checked for existence (`fnpack` exits 0 even when it wrote nothing), then its modes
-are normalised, the manifest `checksum` re-stamped, and the finished package inspected
-(version, checksum, modes, and the UI strings inside it). It lands in `dist/` as
-`<appname>-<version>.fpk`.
+files are cleared; when the external QR source directory exists, the embedded module is
+regenerated, otherwise the committed `donate-qr.js` is kept. The packaging tree is checked
+for identifiers that must never move, symlinks, scaffold placeholders and host-specific
+paths. The artifact is checked for existence (`fnpack` exits 0 even when it wrote nothing),
+then its modes are normalised, the manifest `checksum` re-stamped, and the finished package
+inspected (version, checksum, modes, and the UI strings inside it). It lands in `dist/` as
+`<appname>-<version>-<arch>-<system>.fpk`, e.g. `niufan-2.2.5-x86-fn.fpk`.
+
+The same script then builds the source package from a whitelist
+(`niufan-<version>-source.tar.gz` and `.zip`, rooted at `<appname>/`, with the version read
+back out of it), and finally removes every artifact of another version: the workspace only
+ever holds the current release, while the complete archive lives in
+`/vol1/1000/软件备份/NiuFan/`.
 
 Icons can be regenerated with pure Python (no imaging library needed):
 
@@ -280,6 +288,9 @@ A small JSON API over a Unix socket, authenticated and proxied by the fnOS gatew
 | GET | `/api/status` | sources, live fan state, current config |
 | GET | `/api/config` | config only |
 | GET | `/api/hardware` | detected SuperIO channels and disks |
+| GET | `/api/diagnostics/status` | controllable controller count, detected hwmon names, warnings, stored reports |
+| POST | `/api/diagnostics/export` | collect the hardware snapshot and write a diagnostic report |
+| GET | `/api/diagnostics/download?file=<name>` | download a report (`Content-Disposition: attachment`) |
 | POST | `/api/config` | validate → persist atomically → apply |
 | POST | `/api/action` | `{"action":"restore-auto"}` / `{"action":"refresh-hardware"}` |
 
@@ -303,6 +314,7 @@ python3 package/app/server/fancontrold.py run --host 127.0.0.1 --port 8099   # l
 | Non-administrator | The server checks the gateway's `X-Trim-Isadmin` header and returns `403` unless it is true (fail-closed) |
 | Other local accounts | The app socket is `0600 root:root` — the gateway cannot be bypassed; access control stays with fnOS login |
 | Path traversal | Static file serving validates the resolved path stays inside the UI directory |
+| Diagnostic download | Only accepts a `*.txt` name this app wrote (`..`, absolute paths, subdirectories and symlink escapes are all refused); export and download both require a login, and a network request without gateway identity gets `403` |
 
 ## FAQ
 
@@ -411,22 +423,23 @@ NiuFan/
 ├── README.md / README.en.md
 ├── CHANGELOG.md
 ├── build-fpk.sh              build on fnOS / Linux + version-stamped artifact name
-├── build-fpk.ps1             build on Windows (fnpack.exe)
 ├── package/                  fnpack source tree (packaged into the fpk)
 │   ├── manifest
 │   ├── ICON.PNG / ICON_256.PNG
 │   ├── app/
 │   │   ├── server/           daemon (standard library only)
 │   │   │   ├── fancontrold.py    control loop + HTTP API + static files
+│   │   │   ├── hardwareid.py     active device ID / SuperIO probe + raw backend
 │   │   │   ├── fanhardware.py    SuperIO / hwmon / temperature sources
 │   │   │   └── fanconfig.py      config validation + curve interpolation
 │   │   └── ui/               frontend (plain JS)
 │   ├── cmd/                  lifecycle scripts
 │   └── config/               privilege / resource
+├── tools/make_donate_qr.py   compile external QR images into the UI module
 ├── tools/make_icons.py       pure-Python icon generator
 ├── tools/release_checks.py   version, packaging-tree, mode and artifact checks
 ├── tools/check_compat.py     upgrade / rollback / old-config compatibility checks
-└── dist/                     build output
+└── dist/                     local build output (ignored; never committed)
 ```
 
 ## Contributing

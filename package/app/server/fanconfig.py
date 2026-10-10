@@ -26,6 +26,7 @@ GPU_PREFIX = "gpu:"
 #: so it is inert rather than wrong.
 AUX_PREFIX = "aux:"
 MODES = ("curve", "manual", "auto")
+DRIVER_PREFERENCES = ("auto", "fnos", "software")
 
 #: Fallback curve: quiet when cool, full speed well before the CPU is unhappy.
 DEFAULT_CPU_POINTS = [[30, 20], [45, 35], [60, 60], [75, 100]]
@@ -38,6 +39,7 @@ DEFAULT_CONFIG = {
     # A missing key means "existing install, do not nag with the wizard";
     # a fresh install writes it explicitly as False.
     "setup_complete": True,
+    "driver_preference": "auto",
     "enabled": True,
     "interval": 3,
     "hdd_interval": 60,
@@ -294,6 +296,9 @@ def normalise(config, channels=None, gpu_keys=None):
 
     cfg["version"] = CONFIG_VERSION
     cfg["setup_complete"] = bool(cfg.get("setup_complete", True))
+    preference = str(cfg.get("driver_preference") or "auto")
+    cfg["driver_preference"] = (
+        preference if preference in DRIVER_PREFERENCES else "auto")
     cfg["enabled"] = bool(cfg.get("enabled", True))
     cfg["interval"] = _clamp_int(cfg.get("interval"), 1, 60, 3)
     cfg["hdd_interval"] = _clamp_int(cfg.get("hdd_interval"), 10, 3600, 60)

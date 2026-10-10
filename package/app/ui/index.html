@@ -78,9 +78,11 @@
         <h2 id="setup-title">硬件检测与初始化</h2>
         <button class="modal-close" id="setup-close" title="关闭">✕</button>
       </header>
+      <div class="diag-warn hidden" id="diag-warn"></div>
       <div class="modal-body" id="setup-body"></div>
       <footer class="modal-foot">
         <span class="modal-note" id="setup-note"></span>
+        <button class="btn ghost" id="setup-diag" title="采集本机硬件信息并下载日志，便于反馈识别问题">导出诊断日志</button>
         <button class="btn ghost" id="setup-select-detected">只选有风扇的</button>
         <button class="btn ghost" id="setup-probe" title="逐个通道全速试转，识别停转的风扇">主动检测</button>
         <button class="btn primary" id="setup-apply">应用并保存</button>

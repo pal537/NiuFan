@@ -26,6 +26,7 @@ kernel modules.
 from __future__ import annotations
 
 import argparse
+import copy
 import http.server
 import json
 import os
@@ -39,6 +40,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fanconfig  # noqa: E402
+import fandiag  # noqa: E402
 import fanhardware  # noqa: E402
 
 APP_NAME = "niufan"
@@ -51,7 +53,7 @@ APP_TITLE = "NiuFan"
 LEGACY_APP_NAME = "fn-fancontrol"
 # Must be kept in step with the ``version`` field of the package manifest:
 # the app center does not export TRIM_APPVER to the daemon.
-VERSION = "2.0.1"
+VERSION = "2.2.5"
 
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -105,6 +107,7 @@ class Controller:
         self.config = None
         self.applied = {}       # channel -> "manual" | "auto"
         self.written = {}       # channel -> last duty written
+        self.duty_mismatch_at = {}  # channel -> last override log timestamp
         self.hold = {}          # channel -> (temp, duty) used for hysteresis
         self.fan_state = {}     # channel -> last evaluated state
         self.original = {}      # channel -> (enable, duty) before we touched it
@@ -121,6 +124,10 @@ class Controller:
         self.degraded = False
         self.updated = 0.0
         self.hardware_ready = False
+        self.active_identity = None
+        self.driver_mode = "unknown"
+        self.driver_mode_label = "未识别"
+        self.driver_preference = "auto"
         self.last_identity = None
 
     def record_identity(self, identity):
@@ -159,18 +166,48 @@ class Controller:
             "channels": ["CH%d" % index for index in channels],
         }
 
-    def refresh_hardware(self):
+    def load_driver_preference(self):
+        """Read the persisted backend choice before the first hardware scan."""
+        preference = "auto"
+        try:
+            with open(self.config_path, "r") as handle:
+                raw = json.load(handle)
+            if isinstance(raw, dict):
+                candidate = str(raw.get("driver_preference") or "auto")
+                if candidate in fanconfig.DRIVER_PREFERENCES:
+                    preference = candidate
+        except (OSError, ValueError):
+            pass
+        self.driver_preference = preference
+        return preference
+
+    def refresh_hardware(self, preference=None):
         """Re-scan hwmon; safe to call at any time."""
-        loaded = fanhardware.ensure_modules(self.log)
+        preference = preference or self.driver_preference or "auto"
+        self.driver_preference = preference
+        loaded = fanhardware.ensure_modules(self.log, preference)
         if loaded:
             self.log("loaded kernel module(s): %s" % ", ".join(loaded))
-        path, chip, profile = fanhardware.find_controller()
+        path, chip, profile = fanhardware.find_controller(preference)
         with self.lock:
             self.chip = chip
             self.profile = profile
             self.channels = {c.index: c for c in fanhardware.fan_channels(profile, path)}
             self.hardware_ready = bool(self.channels)
-            self.controllable = bool(profile and profile.controllable)
+            self.controllable = any(c.controllable
+                                    for c in self.channels.values())
+            active = fanhardware.hardware_identity()
+            self.active_identity = active.as_dict() if active is not None else None
+            if (isinstance(path, fanhardware.RawControllerSource)
+                    and self.channels and self.controllable):
+                self.driver_mode = "software"
+                self.driver_mode_label = "软件驱动"
+            elif isinstance(path, str):
+                self.driver_mode = "fnos"
+                self.driver_mode_label = "飞牛驱动"
+            else:
+                self.driver_mode = "unknown"
+                self.driver_mode_label = "未识别"
             self.disks = fanhardware.list_disk_sensors()
             self.gpus = fanhardware.list_gpu_sensors()
             self.aux = fanhardware.list_aux_sensors()
@@ -187,6 +224,36 @@ class Controller:
                        for c in sorted(self.channels.values(), key=lambda x: x.index)]
             self.log("fan controller %s (%s), %d PWM header(s): %s"
                      % (chip, profile.key, len(self.channels), " ".join(headers)))
+
+    def set_driver_preference(self, preference):
+        """Persist and immediately apply a user-selected backend."""
+        if preference not in ("fnos", "software"):
+            raise ValueError("unknown driver preference: %s" % preference)
+
+        config = fanconfig.load(self.config_path, None, None)
+        if config is None:
+            config = copy.deepcopy(fanconfig.DEFAULT_CONFIG)
+        config["driver_preference"] = preference
+        config["setup_complete"] = False
+        config["probe"] = {"at": None, "results": []}
+        for fan in config.get("fans") or []:
+            fan["calibration"] = None
+        fanconfig.save(self.config_path, config)
+
+        self.driver_preference = preference
+        for index in sorted(list(self.applied)):
+            self._release(index)
+        self.probe_results = {}
+        self.applied.clear()
+        self.mode_at.clear()
+        self.written.clear()
+        self.duty_mismatch_at.clear()
+        self.hold.clear()
+        fanhardware.reset_hardware_identity()
+        self.refresh_hardware(preference=preference)
+        self.load_config()
+        self.log("driver mode preference set to %s" % preference)
+        return preference
 
     # -- config ------------------------------------------------------------ #
 
@@ -307,6 +374,9 @@ class Controller:
         with self.lock:
             self.config = config
             self.probe_results = stored
+            preference = config.get("driver_preference") or "auto"
+            if preference in fanconfig.DRIVER_PREFERENCES:
+                self.driver_preference = preference
 
         self._check_hardware_change(config)
         return config
@@ -355,6 +425,7 @@ class Controller:
             self.applied.clear()
             self.mode_at.clear()
             self.written.clear()
+            self.duty_mismatch_at.clear()
             self.hold.clear()
             self.fan_state = {
                 index: state
@@ -488,16 +559,44 @@ class Controller:
         mode = self.applied.get(index)
         stale = time.time() - self.mode_at.get(index, 0.0) >= self.REASSERT_SECONDS
         if mode != "manual" or stale:
+            previous_enable = None
+            if mode == "manual" and stale:
+                try:
+                    previous_enable = channel.enable
+                except OSError:
+                    pass
             if mode != "manual":
                 self._remember_original(channel)
             # profile.manual, not a hard-coded 1: the value differs per driver
-            fanhardware.write_text(channel.path_enable, channel.profile.manual)
+            channel.write_enable(channel.profile.manual)
+            if (previous_enable is not None
+                    and previous_enable != channel.profile.manual):
+                self.log(
+                    "fan%d: firmware/BIOS reset manual mode "
+                    "(enable=%s), reasserted" % (index, previous_enable))
             self.applied[index] = "manual"
             self.mode_at[index] = time.time()
             if mode != "manual":
                 self.written.pop(index, None)
-        if self.written.get(index) != duty:
-            fanhardware.write_text(channel.path_pwm, duty)
+        actual_duty = None
+        try:
+            actual_duty = channel.duty
+        except OSError:
+            pass
+        overridden = (actual_duty is not None
+                      and actual_duty != duty
+                      and self.written.get(index) == duty)
+        if self.written.get(index) != duty or overridden:
+            if overridden:
+                now = time.time()
+                if (now - self.duty_mismatch_at.get(index, 0.0)
+                        >= self.REASSERT_SECONDS):
+                    self.log(
+                        "fan%d: PWM readback %s != requested %s; "
+                        "firmware/BIOS may be overriding, rewrote"
+                        % (index, actual_duty, duty))
+                    self.duty_mismatch_at[index] = now
+            channel.write_duty(duty)
             self.written[index] = duty
 
     def _apply_auto(self, channel):
@@ -631,6 +730,7 @@ class Controller:
         managed = sorted(self.applied)
         if not managed:
             self.log("no channel was under control, nothing to restore")
+            fanhardware.close_active_controller()
             return
         restored = []
         for index in managed:
@@ -646,7 +746,9 @@ class Controller:
         self.applied.clear()
         self.mode_at.clear()
         self.written.clear()
+        self.duty_mismatch_at.clear()
         self.log("handed channel(s) back: %s" % (", ".join(restored),))
+        fanhardware.close_active_controller()
 
     # -- first-run detection ----------------------------------------------- #
 
@@ -676,6 +778,7 @@ class Controller:
                 self.applied.clear()
                 self.mode_at.clear()
                 self.written.clear()
+                self.duty_mismatch_at.clear()
                 self.hold.clear()
                 self.probe_results = {item["channel"]: item for item in results}
             # Persist the whole result set, not just the channels the user goes
@@ -842,6 +945,15 @@ class Controller:
                 "hardware_ready": self.hardware_ready,
                 "controllable": self.controllable,
                 "controller": self.profile.as_dict() if self.profile else None,
+                "active_identity": self.active_identity,
+                "driver_mode": self.driver_mode,
+                "driver_mode_label": self.driver_mode_label,
+                "driver_preference": self.driver_preference,
+                "driver_preference_label": {
+                    "fnos": "飞牛驱动",
+                    "software": "软件驱动",
+                    "auto": "自动",
+                }.get(self.driver_preference, "自动"),
                 "needs_setup": not config.get("setup_complete", True),
                 #: What changed since the calibration, so the wizard can say why
                 #: it came back instead of just appearing again.
@@ -883,15 +995,152 @@ class Controller:
         return {
             "chip": chip,
             "controller": self.profile.as_dict() if self.profile else None,
+            "active_identity": self.active_identity,
+            "driver_mode": self.driver_mode,
+            "driver_mode_label": self.driver_mode_label,
+            "driver_preference": self.driver_preference,
+            "driver_preference_label": {
+                "fnos": "飞牛驱动",
+                "software": "软件驱动",
+                "auto": "自动",
+            }.get(self.driver_preference, "自动"),
             "channels": channels,
             "disks": disks,
             "gpus": gpus,
             "aux": aux,
+            "hardware_inventory": fanhardware.hardware_inventory(),
             # Everything the machine exposes, including inputs no source offers,
             # so the detection screen can account for all of them.
             "temp_inventory": fanhardware.list_temp_inventory(),
             "profiles": [p.as_dict() for p in fanhardware.PROFILES],
             "unsupported": fanhardware.detect_other_controllers(),
+        }
+
+    # -- diagnostics ------------------------------------------------------- #
+
+    #: Sentences the UI shows when no fan controller can be driven.  They live
+    #: here (rather than in the frontend) so the report, the API and the page
+    #: cannot drift apart.
+    NO_CONTROLLER_WARNING = (
+        "未识别到任何可控制的风扇控制器。请点击下方「导出诊断日志」，"
+        "并将日志反馈给开发者。"
+    )
+    MONITOR_ONLY_WARNING = (
+        "识别到风扇控制器 %s，但其驱动只提供只读监控，无法用软件调速。"
+        "请点击下方「导出诊断日志」，并将日志反馈给开发者。"
+    )
+    NO_CONTROLLER_REASONS = (
+        "可能原因：运行身份权限不足（读写 /sys/class/hwmon 与加载内核模块"
+        "都需要 root）、对应内核驱动未加载、主板由 EC 管理风扇，"
+        "或芯片型号尚未被支持。"
+    )
+    MONITOR_ONLY_REASONS = (
+        "可能原因：该芯片只有传感器支持、缺少 PWM 寄存器定义，"
+        "或当前内核模块版本不提供写入接口。"
+    )
+    NO_BACKEND_WARNING = (
+        "已主动识别到风扇控制器 %s，但当前没有可用的 PWM 控制后端。"
+        "请导出诊断日志，确认芯片型号、I/O 基址和进程原始 I/O 权限。"
+    )
+    NO_BACKEND_REASONS = (
+        "可能原因：该型号还没有直接寄存器后端、内核驱动未绑定，"
+        "或运行进程缺少 CAP_SYS_RAWIO / /dev/port 权限。"
+    )
+
+    def diagnostics_status(self, store=None):
+        """What the hardware-detection page needs to decide whether to warn.
+
+        ``controllable_fan_controller_count`` counts controllers this build can
+        actually drive: a controller we can only read (``controllable`` false)
+        counts as zero, because from the user's point of view nothing can be
+        adjusted -- and that is exactly the case the report is meant to explain.
+        """
+        with self.lock:
+            drivable = any(channel.controllable
+                           for channel in self.channels.values())
+            chip = self.chip
+            profile = self.profile.as_dict() if self.profile else None
+            channel_count = len(self.channels)
+        names = [name for _path, name in fanhardware.hwmon_nodes()]
+        warnings = []
+        if not drivable:
+            active = fanhardware.hardware_identity()
+            if active is not None and channel_count == 0:
+                warnings.append(self.NO_BACKEND_WARNING % active.identity.model)
+                warnings.append(self.NO_BACKEND_REASONS)
+            elif chip:
+                warnings.append(self.MONITOR_ONLY_WARNING % chip)
+                warnings.append(self.MONITOR_ONLY_REASONS)
+            else:
+                warnings.append(self.NO_CONTROLLER_WARNING)
+                warnings.append(self.NO_CONTROLLER_REASONS)
+        payload = {
+            "ok": True,
+            "controllable_fan_controller_count": 1 if drivable else 0,
+            "detected_hwmon_names": names,
+            "warnings": warnings,
+            "chip": chip,
+            "controller": profile,
+            "active_identity": (
+                fanhardware.hardware_identity().as_dict()
+                if fanhardware.hardware_identity() is not None else None),
+            "driver_mode": self.driver_mode,
+            "driver_mode_label": self.driver_mode_label,
+            "driver_preference": self.driver_preference,
+            "driver_preference_label": {
+                "fnos": "飞牛驱动",
+                "software": "软件驱动",
+                "auto": "自动",
+            }.get(self.driver_preference, "自动"),
+            "controllable": drivable,
+            "pwm_channel_count": channel_count,
+            "unsupported": fanhardware.detect_other_controllers(),
+            "kernel_conflict_status": fanhardware.kernel_conflict_status(),
+            "reports": [],
+        }
+        if store is not None:
+            payload["reports"] = [
+                {"file": name, "bytes": size,
+                 "at": time.strftime("%Y-%m-%d %H:%M:%S",
+                                     time.localtime(mtime))}
+                for name, size, mtime in store.listing()
+            ]
+        return payload
+
+    def export_diagnostics(self, store, note=None):
+        """Collect a report, write it to ``store`` and return its metadata."""
+        snapshot = self.hardware_info()
+        runtime_logs, missing_logs = fandiag.collect_runtime_logs(
+            store.paths())
+        if not any(item.get("name") == "info.log" for item in runtime_logs):
+            raise OSError("未找到 info.log，拒绝生成不完整的诊断包")
+        with self.lock:
+            config = json.loads(json.dumps(self.config)) if self.config else None
+        context = {
+            "app_name": APP_NAME,
+            "app_title": APP_TITLE,
+            "version": VERSION,
+            "note": note,
+            "paths": store.paths(),
+            "status": self.status(),
+            "hardware": snapshot,
+            "active_identity": snapshot.get("active_identity"),
+            "config": config,
+            "channels": snapshot.get("channels") or [],
+            "unsupported": snapshot.get("unsupported") or [],
+            "runtime_logs": runtime_logs,
+            "runtime_logs_missing": missing_logs,
+            "controllable_fan_controller_count":
+                self.diagnostics_status()["controllable_fan_controller_count"],
+        }
+        text, errors = fandiag.build_report(context)
+        name = store.create(text)
+        return {
+            "ok": True,
+            "file": name,
+            "bytes": len(text.encode("utf-8")),
+            "problems": len(errors),
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
 
@@ -900,10 +1149,16 @@ class Controller:
 # --------------------------------------------------------------------------- #
 
 
-class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    request_queue_size = 64
+if hasattr(socketserver, "UnixStreamServer"):
+    class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+        allow_reuse_address = True
+        request_queue_size = 64
+else:  # pragma: no cover - only on a Python without AF_UNIX (e.g. Windows)
+    #: The gateway socket needs AF_UNIX.  Some Windows Python builds omit it,
+    #: which leaves the TCP test mode (``--host``) as the only way to run the
+    #: daemon there; the shipping platform (fnOS) always has it.
+    UnixHTTPServer = None
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -991,6 +1246,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         return "需要管理员权限"
 
+    def authorise_diagnostics(self):
+        """Authorisation for the diagnostic endpoints -- fail-closed.
+
+        Same gateway policy as every other API call, minus the local shortcut:
+        a request that arrives over TCP without a gateway identity is refused
+        instead of trusted.  Over the Unix socket there is nothing to check --
+        the socket is ``0600`` and owned by the account the daemon runs as, so
+        the peer is already root -- but when the gateway *does* forward an
+        identity, the administrator check applies exactly as it does elsewhere.
+        """
+        identity = self.gateway_identity()
+        if identity["userid"] is None:
+            if UnixHTTPServer is not None and isinstance(self.server,
+                                                         UnixHTTPServer):
+                return None
+            return "需要登录"
+        self.server.controller.record_identity(identity)
+        if not self.server.require_admin:
+            return None
+        if str(identity["isadmin"]).strip().lower() in ("1", "true", "yes"):
+            return None
+        return "需要管理员权限"
+
     # -- static files ------------------------------------------------------ #
 
     def _serve_static(self, rel):
@@ -1029,6 +1307,81 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._respond(200, body, ctype)
 
+    # -- diagnostic downloads ---------------------------------------------- #
+
+    def _query(self):
+        query = urllib.parse.urlparse(self.path).query
+        return urllib.parse.parse_qs(query, keep_blank_values=True)
+
+    def _serve_diagnostic(self):
+        """Serve one stored report as a download.
+
+        The file name is the only thing the caller controls, and it never
+        reaches the filesystem unvalidated: ``DiagnosticStore.resolve`` refuses
+        anything that is not a plain ``*.txt`` name inside the diagnostics
+        directory, so ``..``, absolute paths and symlink escapes are all
+        rejected before a path is built.
+        """
+        store = self.server.diagnostics
+        name = (self._query().get("file") or [""])[0]
+        if not name:
+            self._error(400, "missing file parameter")
+            return
+        path = store.resolve(name)
+        if path is None:
+            # A syntactically invalid name is a rejected request (403); a name
+            # that simply is not there any more is a 404.
+            if not fandiag.NAME_PATTERN.fullmatch(name):
+                self.server.log("diagnostic download refused: %r" % name[:120])
+                self._error(403, "非法的文件名")
+                return
+            self._error(404, "诊断日志不存在或已被清理")
+            return
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read()
+        except OSError as exc:
+            self._error(500, "cannot read diagnostic: %s" % exc)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % name)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _export_diagnostic(self):
+        """Collect a report, store it and hand the caller its download URL."""
+        # The body is optional here and only ever carries a short free-text
+        # note for the developer; anything malformed is simply dropped rather
+        # than failing the export the user asked for.
+        note = None
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if 0 < length <= 4096:
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if isinstance(payload, dict) and payload.get("note") is not None:
+                    note = " ".join(str(payload["note"]).split())[:200] or None
+            except (ValueError, UnicodeDecodeError, OSError):
+                note = None
+        try:
+            result = self.server.controller.export_diagnostics(
+                self.server.diagnostics, note)
+        except OSError as exc:
+            self.server.log("diagnostic export failed: %s" % exc)
+            self._error(500, "无法生成诊断日志：%s" % exc)
+            return
+        result["url"] = "%sapi/diagnostics/download?file=%s" % (
+            self.server.base_path, urllib.parse.quote(result["file"]))
+        self._json(result)
+
     # -- routes ------------------------------------------------------------ #
 
     def do_GET(self):
@@ -1044,6 +1397,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(controller.status()["config"])
         elif path == "/api/hardware":
             self._json(controller.hardware_info())
+        elif path == "/api/diagnostics/status":
+            denied = self.authorise_diagnostics()
+            if denied:
+                self._error(403, denied)
+                return
+            self._json(controller.diagnostics_status(self.server.diagnostics))
+        elif path == "/api/diagnostics/download":
+            denied = self.authorise_diagnostics()
+            if denied:
+                self._error(403, denied)
+                return
+            self._serve_diagnostic()
         elif path == "/api/ping":
             self._json({"ok": True, "app": APP_NAME, "version": VERSION})
         elif path.startswith("/api/"):
@@ -1060,6 +1425,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         path = self._relative()
         controller = self.server.controller
+
+        # The diagnostic export takes no parameters, so it is the one POST that
+        # may legitimately arrive with no body at all (``curl -X POST``).  The
+        # other endpoints keep needing theirs, because for them an absent body
+        # is a malformed request rather than "no options".
+        if path == "/api/diagnostics/export":
+            denied = self.authorise_diagnostics()
+            if denied:
+                self._error(403, denied)
+                return
+            self._export_diagnostic()
+            return
+
         body = self._read_body()
         if body is None:
             self._error(400, "missing or oversized body")
@@ -1118,6 +1496,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 controller.refresh_hardware()
                 controller.load_config()
                 self._json({"ok": True, "hardware": controller.hardware_info()})
+            elif action == "driver-mode":
+                mode = str((payload or {}).get("mode") or "")
+                if mode not in ("fnos", "software"):
+                    self._error(400, "mode must be fnos or software")
+                    return
+                try:
+                    controller.set_driver_preference(mode)
+                except (OSError, ValueError) as exc:
+                    self._error(500, "cannot switch driver mode: %s" % exc)
+                    return
+                self._json({
+                    "ok": True,
+                    "mode": mode,
+                    "status": controller.status(),
+                    "hardware": controller.hardware_info(),
+                })
             else:
                 self._error(400, "unknown action")
         else:
@@ -1141,10 +1535,20 @@ def resolve_paths(args):
         or os.environ.get("TRIM_PKGETC")
         or os.path.join(appdest, "etc")
     )
+    # Runtime data (logs, diagnostic exports) belongs in var/, never in etc/,
+    # so an upgrade or a reinstall can never take the user's configuration with
+    # it and a growing spool of reports can never sit next to config.json.
+    var = (
+        getattr(args, "var", None)
+        or os.environ.get("TRIM_PKGVAR")
+        or os.path.join(appdest, "var")
+    )
     return {
         "appdest": appdest,
         "etc": etc,
+        "var": var,
         "config": os.path.join(etc, "config.json"),
+        "diagnostics": os.path.join(var, "diagnostics"),
         "ui": getattr(args, "ui", None) or os.path.join(appdest, "ui"),
         "socket": (
             getattr(args, "socket", None)
@@ -1156,6 +1560,7 @@ def resolve_paths(args):
 
 def cmd_init_config(args, log, paths):
     controller = Controller(paths["config"], log)
+    controller.load_driver_preference()
     controller.refresh_hardware()
     existing = controller.load_config(create_if_missing=False)
     if existing is not None and not args.force:
@@ -1192,6 +1597,7 @@ def cmd_restore(args, log, paths):
 
 def cmd_status(args, log, paths):
     controller = Controller(paths["config"], log)
+    controller.load_driver_preference()
     controller.refresh_hardware()
     controller.load_config(create_if_missing=False)
     controller.tick()
@@ -1205,7 +1611,11 @@ def cmd_run(args, log, paths):
     if not os.path.isdir(ui_dir):
         log("warning: UI directory %s is missing" % ui_dir)
 
+    diagnostics = fandiag.DiagnosticStore(
+        paths["diagnostics"], APP_NAME, VERSION, log, paths=paths)
+
     controller = Controller(paths["config"], log)
+    controller.load_driver_preference()
     controller.refresh_hardware()
     controller.load_config()
     controller.start()
@@ -1217,6 +1627,10 @@ def cmd_run(args, log, paths):
         endpoint = "http://%s:%d" % (args.host, args.port)
         base_path = "/"
     else:
+        if UnixHTTPServer is None:
+            log("ERROR: this Python has no AF_UNIX support; "
+                "use --host 127.0.0.1 for local testing")
+            return 1
         socket_path = paths["socket"]
         if os.path.exists(socket_path):
             os.unlink(socket_path)
@@ -1230,6 +1644,7 @@ def cmd_run(args, log, paths):
         base_path = gateway_prefix.rstrip("/") + "/"
 
     server.controller = controller
+    server.diagnostics = diagnostics
     server.log = log
     server.ui_dir = ui_dir
     server.gateway_prefix = gateway_prefix
@@ -1271,6 +1686,7 @@ def _add_command(sub, name, help_text, extra=()):
     parser = sub.add_parser(name, help=help_text)
     parser.add_argument("--appdest", help="installed app dir (default $TRIM_APPDEST)")
     parser.add_argument("--etc", help="config dir (default $TRIM_PKGETC)")
+    parser.add_argument("--var", help="runtime data dir (default $TRIM_PKGVAR)")
     for flag, kwargs in extra:
         parser.add_argument(flag, **kwargs)
     return parser

@@ -16,6 +16,8 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 
 const MODE_LABELS = { curve: '温度曲线', manual: '固定转速', auto: 'BIOS 自动' };
 const CURVE = { X0: 38, X1: 332, Y0: 12, Y1: 156, TMIN: 20, TMAX: 100, W: 340, H: 190 };
+const PROJECT_URL = 'https://github.com/LiuFudi/NiuFan';
+const QQ_GROUP = '818299505';
 
 // Mirrors fanconfig.py so a newly added channel draws a usable curve before the
 // first save round-trips through the server.
@@ -25,6 +27,7 @@ const DEFAULT_HDD_POINTS = [[30, 20], [40, 30], [48, 60], [55, 100]];
 let status = null;
 let cfg = null;
 let hardware = { channels: [], disks: [] };
+let diagnostics = null;
 let pollTimer = null;
 let toastTimer = null;
 
@@ -614,10 +617,10 @@ function updateLive() {
     if (others.length) {
       showAlert('没有找到带 PWM 控制的风扇控制器，但检测到其它控制器：' +
         others.map((o) => o.name + '（' + o.hwmon + '）').join('、') +
-        '。点右上角「硬件检测」查看详情。', true);
+        '。点右上角「硬件检测」查看详情，并可导出诊断日志反馈。', true);
     } else {
       showAlert('本机没有暴露任何可用的风扇控制芯片。可能是主板由 EC 管理风扇，' +
-        '或对应的内核驱动未加载。点右上角「硬件检测」查看详情。', true);
+        '或对应的内核驱动未加载。点右上角「硬件检测」查看详情，并可导出诊断日志反馈。', true);
     }
   } else if (status.controllable === false) {
     health.className = 'pulse warn';
@@ -741,6 +744,9 @@ async function boot() {
   }
   await loadDonate();
   await refresh();
+  // Which fan controllers this machine exposes decides whether the detection
+  // page has to warn and offer the log export, so it is fetched up front.
+  await loadDiagnostics();
   pollTimer = setInterval(refresh, 2000);
   if (status && status.needs_setup) {
     showAlert(setupForced()
@@ -788,8 +794,196 @@ $('#master').addEventListener('change', async (event) => {
 
 /* ----------------------------------------------------------- setup wizard -- */
 
-let setupState = { results: null, selected: null, probing: false, busy: false };
+let setupState = {
+  results: null,
+  selected: null,
+  probing: false,
+  busy: false,
+  switching: false,
+  autoSwitchTried: false,
+  autoSwitchedFromFnos: false,
+  failure: null
+};
 let lastSourceKeys = null;
+
+function driverPreferenceLabel(value) {
+  if (value === 'fnos') return '飞牛驱动';
+  if (value === 'software') return '软件驱动';
+  return '自动';
+}
+
+function driverPickerHtml(driverMode) {
+  const preference = (status && status.driver_preference) || 'auto';
+  const active = preference === 'auto'
+    ? (status && status.driver_mode)
+    : preference;
+  const disabled = (setupState.switching || setupState.probing) ? ' disabled' : '';
+  return '<div class="hw-item driver-mode">驱动模式' +
+    '<div class="driver-picker">' +
+      '<button class="btn ghost driver-choice' +
+        (active === 'fnos' ? ' on' : '') + '" data-driver-mode="fnos"' +
+        disabled + '>飞牛驱动</button>' +
+      '<button class="btn ghost driver-choice' +
+        (active === 'software' ? ' on' : '') + '" data-driver-mode="software"' +
+        disabled + '>软件驱动</button>' +
+    '</div><b>当前：' + esc(driverMode) +
+    (preference === 'auto' ? '（自动）' : '（用户选择）') + '</b></div>';
+}
+
+function bindDriverPicker() {
+  $$('[data-driver-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+      switchDriverMode(button.dataset.driverMode, true);
+    });
+  });
+}
+
+function feedbackLinksHtml() {
+  return '<div class="feedback-links">' +
+    '<a class="btn" target="_blank" rel="noopener noreferrer" href="' +
+      PROJECT_URL + '">Git 项目主页</a>' +
+    '<button class="btn" id="copy-qq" data-qq="' + QQ_GROUP + '">复制 QQ 群 ' +
+      QQ_GROUP + '</button>' +
+  '</div>';
+}
+
+function copyText(value) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(value);
+  }
+  const input = document.createElement('textarea');
+  input.value = value;
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  document.body.appendChild(input);
+  input.focus();
+  input.select();
+  try {
+    document.execCommand('copy');
+  } finally {
+    input.remove();
+  }
+  return Promise.resolve();
+}
+
+function bindFailureActions() {
+  const exportButton = $('#setup-failure-diag');
+  if (exportButton) {
+    exportButton.addEventListener('click', () => exportDiagnostics(exportButton));
+  }
+  const copy = $('#copy-qq');
+  if (copy) {
+    copy.addEventListener('click', () => {
+      copyText(copy.dataset.qq).then(() => toast('QQ 群号已复制'));
+    });
+  }
+}
+
+function failureHtml() {
+  const failure = setupState.failure;
+  if (!failure) return '';
+  return '<div class="alert err" style="margin:14px 0 0">' +
+    '<strong>' + esc(failure.title) + '</strong><br>' + esc(failure.detail) +
+    '<br><br>建议检查风扇是否接在正确接口、是否为 3pin 风扇或处于 DC 调速模式，' +
+    '并检查 BIOS 中的风扇控制设置。以上均不强制，您可以关闭本提示并继续操作。' +
+    '<div class="diag-actions">' +
+      '<button class="btn primary" id="setup-failure-diag">导出诊断日志</button>' +
+      '<span class="diag-hint">诊断日志仅用于排查，不会自动上传。</span>' +
+    '</div>' +
+    feedbackLinksHtml() +
+  '</div>';
+}
+
+function setSetupFailure(kind, detail) {
+  if (kind === 'B') {
+    setupState.failure = {
+      kind: kind,
+      title: '软件驱动仍无法识别风扇控制器。',
+      detail: detail
+    };
+  } else {
+    setupState.failure = {
+      kind: kind,
+      title: setupState.autoSwitchedFromFnos
+        ? '飞牛驱动无效，已切换到软件驱动，但仍无法完成有效标定。'
+        : '软件驱动仍无法完成有效标定。',
+      detail: detail
+    };
+  }
+}
+
+/* ------------------------------------------------------- diagnostics log -- */
+
+// The hardware-detection screen owns the log export.  The backend collects the
+// report (board, CPU, GPUs, hwmon, modules, sensors, sanitised config) and
+// stores it under the app's var/ directory; the browser only downloads it.
+
+async function loadDiagnostics() {
+  try {
+    diagnostics = await api('diagnostics/status');
+  } catch (err) {
+    // Without the status call the banner simply stays hidden: the page must
+    // keep working (the table, the probe and the save button) either way.
+    diagnostics = null;
+  }
+  renderDiagnosticsWarning();
+  return diagnostics;
+}
+
+function renderDiagnosticsWarning() {
+  const box = $('#diag-warn');
+  if (!box) return;
+  const warnings = (diagnostics && diagnostics.warnings) || [];
+  if (!warnings.length) {
+    box.className = 'diag-warn hidden';
+    box.innerHTML = '';
+    return;
+  }
+  box.className = 'diag-warn';
+  box.innerHTML = warnings.map((line) => '<p>' + esc(line) + '</p>').join('') +
+    '<div class="diag-actions">' +
+      '<button class="btn primary" id="diag-warn-export">导出诊断日志</button>' +
+      '<span class="diag-hint">日志含主板 / CPU / 显卡 / 风扇控制器 / 内核模块与' +
+      '脱敏后的配置摘要，不含口令与完整序列号。</span>' +
+    '</div>';
+  $('#diag-warn-export').addEventListener('click', () => {
+    exportDiagnostics($('#diag-warn-export'));
+  });
+}
+
+async function exportDiagnostics(button) {
+  const target = button || $('#setup-diag');
+  const label = target ? target.textContent : null;
+  if (target) {
+    target.disabled = true;
+    target.textContent = '正在采集…';
+  }
+  try {
+    const result = await api('diagnostics/export', {
+      method: 'POST',
+      body: JSON.stringify({ note: '用户从「硬件检测」页导出' }),
+    });
+    const url = API + 'diagnostics/download?file=' + encodeURIComponent(result.file);
+    const response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) throw new Error('下载失败 HTTP ' + response.status);
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = result.file;
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => { URL.revokeObjectURL(link.href); link.remove(); }, 1000);
+    toast('诊断日志已生成并开始下载：' + result.file);
+    await loadDiagnostics();
+  } catch (err) {
+    toast('导出诊断日志失败：' + err.message, true);
+  } finally {
+    if (target) {
+      target.disabled = false;
+      target.textContent = label;
+    }
+  }
+}
 
 // Channel list for the wizard: everything the controller exposes, merged with
 // the most recent probe result when there is one.
@@ -812,7 +1006,8 @@ function setupForced() {
   if (!status || !status.needs_setup) return false;
   // Nothing to calibrate means nothing to block on: with no channels there is
   // no fan to get wrong, and the wizard's job becomes explaining that instead.
-  return (hardware.channels || []).length > 0;
+  return (hardware.channels || []).some((channel) =>
+    channel.controllable !== false);
 }
 
 //: "Calibrated" means a probe has actually produced results.
@@ -824,6 +1019,9 @@ function openSetup() {
   setupState.selected = null;
   $('#setup').classList.remove('hidden');
   renderSetup();
+  // Refresh the "can we control a fan at all?" answer every time the dialog is
+  // opened: it is what decides whether the export banner is shown.
+  loadDiagnostics();
 }
 
 function closeSetup() {
@@ -844,6 +1042,9 @@ function renderSetup() {
   const body = $('#setup-body');
   const note = $('#setup-note');
   const ctrl = (status && status.controller) || hardware.controller || null;
+  const active = (status && status.active_identity) || hardware.active_identity || null;
+  const driverMode = (status && (status.driver_mode_label || status.driver_mode))
+    || hardware.driver_mode_label || hardware.driver_mode || '未识别';
   const channels = setupChannels();
   const controllable = !status || status.controllable !== false;
   const forced = setupForced();
@@ -852,14 +1053,24 @@ function renderSetup() {
   if (setupState.selected === null) setupState.selected = defaultSelection(channels);
 
   if (!channels.length) {
+    const activeText = active
+      ? '已主动识别到 <strong>' + esc(
+          (active.vendor || '') + ' ' + (active.model || '') +
+          (active.chip_id ? ' · ' + active.chip_id : '')) +
+        '</strong>，但当前没有可用的 PWM 控制后端。'
+      : '主动探测也没有得到明确的 PWM 控制器型号。';
     body.innerHTML =
+      '<div class="hw-card">' + driverPickerHtml(driverMode) + '</div>' +
       '<div class="alert err" style="margin:0">' +
       '没有找到任何带 PWM 控制的风扇控制器。<br><br>' +
+      activeText + '<br><br>' +
       '可能的原因：主板风扇由 EC 管理（笔记本 / 部分迷你主机）、' +
       '对应内核驱动未加载，或芯片型号尚未被支持。' +
       '可以执行 <code>dmesg | grep -iE "nct|it87|f718|w836"</code> 与 ' +
       '<code>cat /sys/class/hwmon/*/name</code> 进一步排查。' +
-      '</div>';
+      '</div>' + failureHtml();
+    bindDriverPicker();
+    bindFailureActions();
     note.textContent = '';
     $('#setup-apply').disabled = true;
     return;
@@ -946,8 +1157,16 @@ function renderSetup() {
       return '';
     })() +
     '<div class="hw-card">' +
+      driverPickerHtml(driverMode) +
       '<div class="hw-item">风扇控制器<b>' + esc((status && status.chip) || hardware.chip || '未知') + '</b></div>' +
       '<div class="hw-item">驱动家族<b>' + esc(ctrl ? ctrl.label : '未知') + '</b></div>' +
+      (active
+        ? '<div class="hw-item">主动识别<b>' +
+          esc((active.vendor || '') + ' ' + (active.model || '') +
+              (active.chip_id ? ' · ' + active.chip_id : '')) + '</b></div>' +
+          '<div class="hw-item">控制接口<b>' +
+          esc(active.control_interface || '未知') + '</b></div>'
+        : '') +
       '<div class="hw-item">PWM 通道<b>' + channels.length + ' 路</b></div>' +
       '<div class="hw-item">可调速<b>' +
         (controllable ? '<span class="tag yes">是</span>' : '<span class="tag warn">否（仅监控）</span>') +
@@ -958,6 +1177,7 @@ function renderSetup() {
       ? '<div class="alert">还检测到其它带 PWM 的控制器，但未被使用：' +
         others.map((o) => esc(o.name + '（' + o.hwmon + '）')).join('、') + '</div>'
       : '') +
+    failureHtml() +
     // Sensors and headers side by side: the wizard is read once, and having
     // both lists in view at the same time is what makes it a single page.
     '<div class="setup-grid">' +
@@ -1018,6 +1238,9 @@ function renderSetup() {
         '</div>';
     })();
 
+  bindDriverPicker();
+  bindFailureActions();
+
   $$('[data-chan]').forEach((input) => {
     input.addEventListener('change', () => {
       const ch = Number(input.dataset.chan);
@@ -1053,6 +1276,75 @@ function renderSetup() {
   }
 }
 
+async function probeOnce() {
+  const res = await api('probe', {
+    method: 'POST',
+    body: JSON.stringify({ settle: 4 })
+  });
+  setupState.results = res.results || [];
+  hardware = res.hardware || hardware;
+  // A probe can change what counts as controllable (a channel that answered
+  // PWM is a controller we *can* drive), so the banner is re-evaluated too.
+  await loadDiagnostics();
+  if (setupState.selected === null) setupState.selected = new Set();
+  setupState.results.forEach((r) => {
+    if (r.detected && r.controllable !== false) setupState.selected.add(r.channel);
+  });
+  return setupState.results;
+}
+
+function setupResultsSummary() {
+  const results = setupState.results || [];
+  const detected = results.filter((item) => item.detected);
+  const responsive = detected.filter((item) => item.responsive);
+  return {
+    results: results,
+    detected: detected,
+    responsive: responsive,
+    unresponsive: detected.filter((item) => !item.responsive)
+  };
+}
+
+async function switchDriverMode(mode, autoProbe) {
+  if (setupState.switching) return false;
+  setupState.switching = true;
+  setupState.failure = null;
+  renderSetup();
+  const note = $('#setup-note');
+  if (note) {
+    note.innerHTML = '<span class="spin"></span>正在切换到' +
+      esc(driverPreferenceLabel(mode)) + '…';
+  }
+  try {
+    const res = await api('action', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'driver-mode', mode: mode })
+    });
+    hardware = res.hardware || hardware;
+    status = await api('status');
+    cfg = await api('config');
+    setupState.results = null;
+    setupState.selected = null;
+    setupState.failure = null;
+    setupState.autoSwitchTried = true;
+    renderAll();
+    renderSetup();
+    toast('已切换到' + driverPreferenceLabel(mode) +
+          '，正在刷新设备状态');
+    if (autoProbe && (hardware.channels || []).length) {
+      await probeOnce();
+      renderSetup();
+    }
+    return true;
+  } catch (err) {
+    toast('切换驱动失败：' + err.message, true);
+    return false;
+  } finally {
+    setupState.switching = false;
+    renderSetup();
+  }
+}
+
 async function runProbe() {
   if (setupState.probing) return;
   setupState.probing = true;
@@ -1061,19 +1353,52 @@ async function runProbe() {
   button.disabled = true;
   note.innerHTML = '<span class="spin"></span>正在逐路标定（先约 30% 再全速，各等转速稳定）…';
   try {
-    const res = await api('probe', { method: 'POST', body: JSON.stringify({ settle: 4 }) });
-    setupState.results = res.results || [];
-    hardware = res.hardware || hardware;
-    // newly found fans join the selection; nothing is ever removed
-    if (setupState.selected === null) setupState.selected = new Set();
-    setupState.results.forEach((r) => {
-      if (r.detected && r.controllable !== false) setupState.selected.add(r.channel);
-    });
+    await probeOnce();
+    let summary = setupResultsSummary();
+
+    // The FnOS hwmon path is tried first on a fresh install.  If it sees fans
+    // but none of them follow the duty cycle, try the direct Super-I/O backend
+    // once, then calibrate again automatically.
+    if ((!summary.detected.length || !summary.responsive.length)
+        && status && status.driver_mode !== 'software'
+        && !setupState.autoSwitchTried) {
+      setupState.autoSwitchTried = true;
+      setupState.autoSwitchedFromFnos = true;
+      if (note) {
+        note.innerHTML = '<span class="spin"></span>' +
+          '飞牛驱动标定无效，正在切换到软件驱动并重新标定…';
+      }
+      const switched = await switchDriverMode('software', true);
+      if (switched) {
+        summary = setupResultsSummary();
+      }
+    }
+
+    if (!summary.responsive.length) {
+      if (!summary.detected.length) {
+        const active = (status && status.active_identity) ||
+          hardware.active_identity;
+        setSetupFailure(
+          'B',
+          active
+            ? '软件驱动无法从当前设备获得可标定的 PWM 通道，' +
+              '已识别到 ' + (active.model || active.chip_id || '未知设备') + '。'
+            : '软件驱动无法识别当前设备，也没有获得可标定的 PWM 通道。');
+      } else {
+        setSetupFailure(
+          'A',
+          '软件驱动已识别到 ' + summary.detected.length +
+          ' 路有转速的风扇，但 100% 与 0% 标定没有得到转速变化。');
+      }
+    } else {
+      setupState.failure = null;
+    }
+
     renderSetup();
-    const found = setupState.results.filter((r) => r.detected).length;
-    const dead = setupState.results.filter(
-      (r) => r.detected && r.responsive === false).length;
-    toast('标定完成：' + found + ' / ' + setupState.results.length + ' 路接有风扇' +
+    const found = summary.detected.length;
+    const dead = summary.unresponsive.length;
+    toast('标定完成：' + found + ' / ' + summary.results.length +
+          ' 路接有风扇' +
           (dead ? '，其中 ' + dead + ' 路转速不受控' : ''));
   } catch (err) {
     note.textContent = '';
@@ -1106,6 +1431,9 @@ async function applySetup() {
 }
 
 $('#btn-detect').addEventListener('click', openSetup);
+$('#setup-diag').addEventListener('click', () => {
+  exportDiagnostics($('#setup-diag'));
+});
 
 // Closing the wizard without applying means "keep what I have" -- record that
 // so it does not reappear on every page load.  On a first run there is nothing

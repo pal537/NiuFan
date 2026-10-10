@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-x86-lightgrey.svg)](#兼容性)
 [![fnOS](https://img.shields.io/badge/fnOS-%E2%89%A51.1.3100-green.svg)](https://www.fnnas.com/)
-[![Version](https://img.shields.io/badge/version-2.0.1-orange.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.5-orange.svg)](CHANGELOG.md)
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -32,6 +32,9 @@
 |---|---|
 | 🌡️ **温度源覆盖整机** | CPU（coretemp / k10temp / PECI）、显卡（amdgpu / i915 / xe / nouveau / nvidia-smi）、硬盘（drivetemp / nvme / smartctl 兜底），外加主板（SYSTIN / CPUTIN / T_SENSOR）、内存（jc42 / spd5118）与 ACPI 热区，**每路一个独立开关** |
 | 🔍 **硬件自检向导** | 首次启动自动列出控制器暴露的**全部** PWM 通道、实际转速与 BIOS 绑定的温度源，可逐个通道全速试转识别停转的风扇 |
+| 🧬 **主动硬件识别** | 不只读取内核已有的 `hwmon`：同时采集 DMI / PCI / USB / ACPI / I2C / 设备树 ID，并只读探测 x86 Super-I/O 配置空间；报告厂商、设备 ID、型号、I/O 基址和可用控制后端 |
+| 🛠️ **无 hwmon 回退** | 对寄存器表明确的 Nuvoton NCT6779/679x 与 ITE IT87xx，可在飞牛内核没有绑定驱动时使用受控用户态寄存器后端；带进程锁、原始状态快照和停止/卸载恢复 |
+| 🧾 **诊断日志导出** | 「硬件检测」页一键导出本机硬件快照与运行日志：主板 / BIOS、CPU、显卡、风扇控制器（hwmon 名称、驱动模块、PWM 通道）、内核模块、传感器读数、`info.log` / 安装 / 升级日志与**脱敏后**的配置摘要，文件名包含设备标识，单个 txt 直接下载；缺少 `info.log` 时拒绝导出不完整包 |
 | ⏬ **标定含 0 %** | 标定会把风扇降到 0 %，因此能直接查出风扇是否支持停转（0 % 读到 0 RPM），标定结果会保存并在下次打开时回显 |
 | 💽 **按盘选择，不按位置** | 硬盘用型号 + 序列号标识（`/dev/disk/by-id`），不是 `sda`/`sdb`：换盘位、换线或改启动顺序后，选择依然对应同一块盘 |
 | 🖥️ **每块显卡一个温度源** | 单卡时是一张「显卡」卡片，多卡时自动拆成「显卡1 / 显卡2 …」，各自独立开关且卡内显示型号，不会再出现两个勾选框管同一件事 |
@@ -75,14 +78,15 @@
 
 ### 从 Release 安装
 
-1. 到 [Releases](../../releases) 下载 `niufan-<版本>.fpk`（或直接用仓库 `dist/` 里的文件）
+1. 到 [Releases](../../releases) 下载 `niufan-<版本>-<架构>-<系统>.fpk`（飞牛包即
+   `niufan-2.2.5-x86-fn.fpk`）
 2. 飞牛 **应用中心 → 手动安装**，选择该 `.fpk`，选一个存储空间
 3. 安装完成后打开 **风扇控制**
 
 也可以走命令行：
 
 ```bash
-sudo appcenter-cli install-fpk niufan-1.2.0.fpk -v 3   # -v 是存储空间序号
+sudo appcenter-cli install-fpk niufan-2.2.5-x86-fn.fpk -v 3   # -v 是存储空间序号
 sudo appcenter-cli start niufan
 ```
 
@@ -115,25 +119,37 @@ PWM 控制、是否支持停转。**只有一种情况不阻塞**：机器上根
 > 折叠起来并注明原因 —— 读数为 0、超出合理范围按未接传感器处理、与 CPU 温度重复等）
 > 和所有 PWM 通道（无转速的同样折叠，可能是没接风扇，也可能是风扇停转）。
 
+> 🧾 **识别不出风扇控制器时，先导出诊断日志。** 此时「硬件检测」页顶部会出现警告，
+> 点旁边的「导出诊断日志」即可下载一份硬件快照和运行日志（主板 / BIOS、CPU、显卡、内核模块、
+> 每个 hwmon 节点的名称与 `pwm*` 状态、当前传感器读数、`info.log`、脱敏后的配置摘要；不含口令、
+> 密钥、用户文件与完整序列号），把它发给开发者就能直接看出是权限不足、驱动没加载，
+> 还是芯片型号没被支持。日志是单个 txt，放在 `var/diagnostics/`，只保留最近 20 份。
+
 > 💡 **推荐起步配置**：机箱风扇绑 `硬盘`，CPU 风扇绑 `CPU`。
 > 硬盘曲线可以设成 `40°C → 30%`、`48°C → 60%`、`55°C → 100%`。
 
 ## 兼容性
 
-能不能用，取决于**风扇挂在哪颗控制器上，以及它的内核驱动有没有被适配**。
+能不能用，优先取决于**风扇挂在哪颗控制器上，以及它的内核驱动有没有被适配**。
+2.2.5 起，NiuFan 也会主动探测设备 ID；NCT6779/679x 与 IT87xx 在满足
+root、`CAP_SYS_RAWIO`/`/dev/port` 且寄存器资料完整时，可绕过未绑定的 `hwmon`
+使用直接后端。IT8613E 也按 Linux hwmon 上游已接受的 `0x8613` / GPIO 复用规则
+接入，即使飞牛自带内核的 `it87` 还不认识该 ID 也可以主动识别并控制。其它型号
+仍优先依赖已有内核驱动，不会盲写未知寄存器。
 各驱动家族的 `pwm_enable` 语义**并不相同**（写错值可能把风扇控制整个关掉），
 所以每个家族都有独立配置，数值全部取自内核文档 `Documentation/hwmon/*.rst`：
 
 | 控制器家族 | 内核驱动 | 手动 | 自动 | 状态 |
 | --- | --- | :---: | :---: | --- |
-| Nuvoton NCT6775 / 6776 / 6779 / 679x / 6106 | `nct6775` | `1` | `5` Smart Fan IV | ✅ 已实测 |
-| ITE IT87xx（IT8603E … IT87952E 全系） | `it87` | `1` | `2` ※ | ✅ 已适配 |
-| Fintek F718xx / F8000 / F81865F | `f71882fg` | `1` | `2` | ✅ 已适配 |
+| Nuvoton NCT6106 / 6116 / 6775 / 6776 / 6779 / 679x | `nct6775` | `1` | `5` Smart Fan IV | ✅ 已实测 |
+| ITE IT87xx（含 IT8613E / IT8689E） | `it87` | `1` | `2` ※ | ✅ 已适配 |
+| Fintek F718xx / F8000 / F81865F / F81968 | `f71882fg` | `1` | `2` | ✅ 已适配 |
 | Fintek F71805F / F71872F | `f71805f` | `1` | `2` | ✅ 已适配 |
 | Winbond W83627EHF / DHG / UHG / W83667HG | `w83627ehf` | `1` | `2` | ✅ 已适配 |
-| Winbond W83627HF / THF / W83697HF | `w83627hf` | `1` | `2` | ✅ 已适配 |
+| Winbond W83627HF / THF / 37HF / 87THF / 97HF | `w83627hf` | `1` | `2` | ✅ 已适配 |
 | SMSC SCH5627 / SCH5636 | `sch5627` / `sch5636` | `1` | `2` | ✅ 已适配 |
 | **Nuvoton NCT6683 / 6686 / 6687** | `nct6683` | — | — | ⚠️ **仅监控** |
+| ITE IT8613E | `it87` | `1` | `2` | ✅ 主动识别 / 用户态回退 |
 | 其它带 `pwmN` 的 hwmon 节点 | 任意 | `1` | `2` | ⚠️ 通用兜底，未验证 |
 | ACPI `PNP0C0B` 风扇对象 | — | — | — | ❌ DSDT 空壳 |
 | 风扇由 EC 管理（笔记本 / 部分迷你主机） | — | — | — | ❌ 没有 pwm 节点 |
@@ -167,6 +183,15 @@ sudo modprobe it87 ignore_resource_conflict=1   # 只影响该驱动，风险相
 # 或在内核启动参数加 acpi_enforce_resources=lax（影响面更大）
 ```
 
+NiuFan 现在会主动读取最近的内核日志并检测这类冲突。若已有 `raw-superio` 直接
+后端，冲突不会阻止用户态控制；软件会在控制循环中周期性重新写入手动模式，
+并在检测到固件/BIOS 把模式改回时写入应用日志。诊断日志第 6 节也会列出检测到的
+ACPI / SuperIO 冲突记录。
+
+首次安装打开「硬件检测」后，可通过顶部按钮切换飞牛驱动 / 软件驱动。飞牛驱动
+标定无响应时，软件会自动尝试软件驱动并重新标定；软件驱动仍失败时只在检测页
+给出可关闭的排查提示，不会强制反馈或强制导出日志。
+
 **NCT6683 / 6686 / 6687 为什么只读**：内核 `nct6683` 驱动的文档明确写着，Intel EC
 固件的寄存器布局与 Nuvoton 数据手册不符，**从操作系统写入任何值都被视为风险过高
 而禁用**（驱动根本不导出可写的 `pwmN`）。这类主板（ASRock B650/X670E、MSI B550/X670
@@ -179,22 +204,16 @@ sudo modprobe it87 ignore_resource_conflict=1   # 只影响该驱动，风险相
 ```bash
 git clone https://github.com/LiuFudi/NiuFan.git
 cd NiuFan
-./build-fpk.sh                     # 产出 dist/niufan-<版本>.fpk
+./build-fpk.sh                     # 产出 dist/niufan-<版本>-<架构>-<系统>.fpk
 ```
 
-Windows 上装了官方 `fnpack-1.2.3-windows-amd64` 就能直接出包（脚本会修掉它写成 0666
-的权限位，否则 `cmd/*` 装上去不可执行）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build-fpk.ps1
-```
-
-两个入口跑的是同一套检查（`tools/release_checks.py`），任何一条不通过都直接以非零码退出：
+构建脚本跑的是 `tools/release_checks.py`，任何一条不通过都直接以非零码退出：
 
 1. **版本号交叉校验**：`package/manifest` 的 `version`、`app/server/fancontrold.py` 的
    `VERSION`、`CHANGELOG.md` 顶层条目、README 顶部徽章必须一致
-2. 从 `package/manifest` 读取 `appname` 与 `version`
-3. 清理 `__pycache__` / `*.pyc` / 遗留 `.fpk`，重建内嵌收款码
+2. 从 `package/manifest` 读取 `appname`、`version` 与 `platform`（架构）
+3. 清理 `__pycache__` / `*.pyc` / 遗留 `.fpk`；外部收款码目录存在时重建内嵌模块，
+   不存在时使用仓库内已提交的 `donate-qr.js`
 4. **打包树检查**：必需文件齐全；`appname` / `desktop_applaunchname` / `display_name` /
    网关路径等标识未被改动；无软链接、无脚手架占位符、无主机专属路径或口令；
    manifest 的值里不能出现 `;`（fnpack 会把它当行内注释，desc 会被截断）
@@ -202,8 +221,11 @@ powershell -ExecutionPolicy Bypass -File build-fpk.ps1
 6. 归一包内权限（`cmd/*` 755、其余 644）并重算 manifest 的 `checksum`
 7. **成品检查**：版本、`checksum == md5(app.tgz)`、权限、软链接，以及包内 UI 文案
    （`<h1>NiuFan</h1>`、Github 链接与 QQ 群号）都对，才重命名为
-   **`<appname>-<version>.fpk`** 放进 `dist/`
-8. 清理历史遗留的无版本号产物，但保留其它版本的产物
+   **`<appname>-<version>-<arch>-<system>.fpk`**（如 `niufan-2.2.5-x86-fn.fpk`）放进 `dist/`
+8. 生成**源码包**（`release_checks.py sourcepkg`）：按白名单收集源码 → 写成以 `<appname>/`
+   为根的 `niufan-<版本>-source.tar.gz` 与 `.zip` → 回读包内 `manifest.version` 校验
+9. 删掉无版本号的遗留产物与**其它版本**的产物 —— 工作区只留当前版本
+   （《通用开发规范》3.1；历史版本归档在 `/vol1/1000/软件备份/NiuFan/`）
 
 图标可以重新生成（纯 Python，无第三方依赖）：
 
@@ -280,6 +302,9 @@ python3 tools/check_compat.py      # 旧配置读取、改名迁移、卸载保�
 | GET | `/api/status` | 温度源、风扇实时状态、当前配置 |
 | GET | `/api/config` | 仅配置 |
 | GET | `/api/hardware` | 探测到的 SuperIO 通道与硬盘清单 |
+| GET | `/api/diagnostics/status` | 可控制控制器数量、检测到的 hwmon 名称、警告文案、已存日志清单 |
+| POST | `/api/diagnostics/export` | 采集硬件信息并生成诊断日志，返回文件名与下载地址 |
+| GET | `/api/diagnostics/download?file=<名称>` | 下载诊断日志（`Content-Disposition: attachment`） |
 | POST | `/api/config` | 校验 → 原子落盘 → 立即生效 |
 | POST | `/api/action` | `{"action":"restore-auto"}` / `{"action":"refresh-hardware"}` |
 
@@ -303,6 +328,7 @@ python3 package/app/server/fancontrold.py run --host 127.0.0.1 --port 8099   # �
 | 非管理员访问 | 服务端校验网关注入的 `X-Trim-Isadmin`，为假或缺失一律 `403`（fail-closed） |
 | 本机其它账号 | 应用 socket 为 `0600 root:root`，无法绕过网关直连；访问控制交还飞牛登录态 |
 | 路径穿越 | 静态文件服务对目标路径做 `realpath` 边界校验 |
+| 诊断日志下载 | 只接受本应用生成的 `*.txt` 文件名（`..`、绝对路径、子目录、软链接逃逸一律拒绝）；导出与下载都要登录态，没有网关登录态的网络请求一律 `403` |
 
 ## 常见问题
 
@@ -406,22 +432,33 @@ NiuFan/
 ├── README.md / README.en.md
 ├── CHANGELOG.md
 ├── build-fpk.sh              构建（fnOS / Linux）+ 版本化命名
-├── build-fpk.ps1             构建（Windows，fnpack.exe）
 ├── package/                  fnpack 源码树（会被打包进 fpk）
 │   ├── manifest
 │   ├── ICON.PNG / ICON_256.PNG
 │   ├── app/
 │   │   ├── server/           守护进程（纯标准库）
 │   │   │   ├── fancontrold.py    控制循环 + HTTP API + 静态页面
+│   │   │   ├── fandiag.py        诊断日志采集（硬件快照 + 脱敏 + 存储）
+│   │   │   ├── hardwareid.py     主动设备 ID / SuperIO 探测与直接后端
 │   │   │   ├── fanhardware.py    SuperIO / hwmon / 温度源
 │   │   │   └── fanconfig.py      配置校验 + 曲线插值
 │   │   └── ui/               前端（原生 JS）
 │   ├── cmd/                  生命周期脚本
 │   └── config/               privilege / resource
+├── tools/make_donate_qr.py   从源码树外读取收款码并生成内嵌模块
 ├── tools/make_icons.py       纯 Python 图标生成
 ├── tools/release_checks.py   版本校验 / 打包树检查 / 权限归一 / 成品检查
 ├── tools/check_compat.py     新旧配置与升级回退的兼容性检查
-└── dist/                     构建产物
+├── tools/test_diagnostics.py 诊断日志接口的端到端与安全测试
+└── dist/                     本地构建产物（被 .gitignore 排除，不入仓库和源码包）
+```
+
+运行时目录（安装后，`etc/` 与 `var/` 都是平台分配的持久目录）：
+
+```
+etc/config.json               用户配置（曲线、标定、温度源选择）
+var/info.log                  运行日志
+var/diagnostics/*.txt         导出的诊断日志（最近 20 份 / 最多 7 天）
 ```
 
 ## 贡献

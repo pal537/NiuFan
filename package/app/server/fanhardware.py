@@ -32,15 +32,17 @@ import shutil
 import subprocess
 import time
 
+import hardwareid
+
 # --------------------------------------------------------------------------- #
 # low level sysfs helpers
 # --------------------------------------------------------------------------- #
 
 
-def read_text(path):
+def read_text(path, limit=None):
     try:
         with open(path, "r") as handle:
-            return handle.read().strip()
+            return (handle.read() if limit is None else handle.read(limit)).strip()
     except (OSError, ValueError):
         return None
 
@@ -101,7 +103,7 @@ class ControllerProfile:
 PROFILES = (
     ControllerProfile(
         key="nct6775",
-        label="Nuvoton NCT6775 / 6776 / 6779 / 679x",
+        label="Nuvoton NCT6106 / 6116 / 6775 / 6776 / 6779 / 679x",
         prefixes=("nct6106", "nct6775", "nct6776", "nct6779", "nct6791", "nct6792",
                   "nct6793", "nct6795", "nct6796", "nct6797", "nct6798", "nct6799"),
         manual=1,          # manual mode
@@ -124,10 +126,13 @@ PROFILES = (
     ControllerProfile(
         key="it87",
         label="ITE IT87xx",
-        prefixes=("it87", "it8603", "it8620", "it8623", "it8628", "it8689",
+        prefixes=("it87", "it8603", "it8613", "it8620", "it8623", "it8628",
+                  "it8689",
                   "it8712", "it8716", "it8718", "it8720", "it8721", "it8726",
                   "it8728", "it8732", "it8758", "it8771", "it8772", "it8781",
                   "it8782", "it8783", "it8786", "it8790", "it8792", "it87952"),
+        # it8613 is the hwmon name in the pending upstream support patch.
+        # The other extra names are retained for older driver releases.
         manual=1,
         auto=2,            # "Smart Guardian" -- only implemented for
                            # pre-IT8705F-revF / pre-IT8712F-revG chips;
@@ -138,9 +143,10 @@ PROFILES = (
     ControllerProfile(
         key="f71882fg",
         label="Fintek F718xx / F8000",
-        prefixes=("f71808e", "f71808a", "f71858fg", "f71862fg", "f71863fg", "f71869",
+        prefixes=("f71808e", "f71808a", "f71858fg", "f71862fg", "f71863fg",
+                  "f71868a", "f71869",
                   "f71869a", "f71882fg", "f71883fg", "f71889fg", "f71889ed", "f71889a",
-                  "f8000", "f81801u", "f81865f"),
+                  "f8000", "f81768d", "f81801u", "f81865f", "f81866a"),
         manual=1,
         auto=2,            # 3 = thermostat mode, F8000 duty-cycle only
         modules=("f71882fg",),
@@ -161,8 +167,8 @@ PROFILES = (
     ),
     ControllerProfile(
         key="w83627hf",
-        label="Winbond W83627HF / THF / W83697HF",
-        prefixes=("w83627hf", "w83627thf", "w83697hf", "w83687thf"),
+        label="Winbond W83627HF / THF / W83637HF / W83697HF",
+        prefixes=("w83627hf", "w83627thf", "w83637hf", "w83697hf", "w83687thf"),
         manual=1, auto=2,
         modules=("w83627hf",),
     ),
@@ -218,6 +224,57 @@ _HWMON_INDEX = re.compile(r"hwmon(\d+)$")
 _PWM_NAME = re.compile(r"pwm(\d+)$")
 _FAN_INPUT = re.compile(r"fan(\d+)_input$")
 
+_HARDWARE_INVENTORY = None
+_ACTIVE_CONTROLLER = None
+
+_KERNEL_CONFLICT = re.compile(
+    r"(?:ACPI.*(?:resource|region).*(?:conflict|busy|already in use)|"
+    r"(?:resource|region).*(?:conflict|already in use)|"
+    r"(?:it87|nct6775|nct6683|f71882fg|f71805f|w83627ehf|w83627hf|sch56xx)"
+    r".*(?:ACPI|resource|region|conflict|busy|failed|denied))",
+    re.I)
+
+
+def kernel_conflict_status(limit=20):
+    """Return kernel-log conflict lines and whether a log source was readable.
+
+    ``dmesg`` is the primary source.  Some minimal fnOS installations do not
+    provide the command to non-interactive processes, so fall back to the
+    persistent kernel logs when that file exists.
+    """
+    text = None
+    source = None
+    try:
+        proc = subprocess.run(["dmesg"], capture_output=True, timeout=6,
+                              check=False)
+        if proc.returncode == 0:
+            text = proc.stdout.decode("utf-8", "replace")
+            source = "dmesg"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not text:
+        for path in ("/var/log/kern.log", "/var/log/messages"):
+            text = read_text(path, limit=262144)
+            if text:
+                source = path
+                break
+    if not text:
+        return {"available": False, "source": None, "lines": []}
+    lines = []
+    for line in text.splitlines():
+        if _KERNEL_CONFLICT.search(line):
+            line = line.strip()
+            if line:
+                lines.append(line[:500])
+            if len(lines) >= limit:
+                break
+    return {"available": True, "source": source, "lines": lines}
+
+
+def kernel_conflict_lines(limit=20):
+    """Return kernel-log lines that indicate Super-I/O resource conflicts."""
+    return kernel_conflict_status(limit)["lines"]
+
 
 def hwmon_nodes():
     """Return ``[(path, name)]`` for every hwmon node, in numeric order."""
@@ -239,13 +296,8 @@ def has_pwm_attribute(path):
     return False
 
 
-def find_controller():
-    """Locate the fan controller.
-
-    Returns ``(hwmon_path, chip_name, profile)``, or ``(None, None, None)``.
-    A known chip always wins over the generic fallback, so a supported board is
-    never driven with the wrong ``pwm_enable`` convention.
-    """
+def hwmon_controller():
+    """Locate a controller already exposed through Linux hwmon."""
     fallback = None
     for path, name in hwmon_nodes():
         profile = profile_for(name)
@@ -255,6 +307,167 @@ def find_controller():
             fallback = (path, name, GENERIC_PROFILE)
     if fallback is not None:
         return fallback
+    return None, None, None
+
+
+def profile_by_key(key):
+    for profile in PROFILES:
+        if profile.key == key:
+            return profile
+    return None
+
+
+class RawControllerSource:
+    """Lazy direct-register controller used when no hwmon driver bound."""
+
+    def __init__(self, identity, profile):
+        self.identity = identity
+        self.profile = profile
+        self.backend = None
+        self.last_error = None
+        self.controllable = bool(
+            identity.raw_kind in ("nct6775", "it87", "it8613")
+            and identity.io_base)
+
+    @property
+    def name(self):
+        return "raw:%s:0x%02x" % (self.identity.raw_kind,
+                                  self.identity.config_port)
+
+    def _open(self):
+        if self.backend is not None:
+            return self.backend
+        if not self.controllable:
+            raise OSError("该芯片没有可用的直接控制后端")
+        try:
+            self.backend = hardwareid.RawSuperIoController(
+                self.identity, self.profile)
+        except OSError as exc:
+            self.last_error = str(exc)
+            raise
+        return self.backend
+
+    def read_rpm(self, index):
+        return self._open().read_rpm(index)
+
+    def read_duty(self, index):
+        return self._open().read_duty(index)
+
+    def read_enable(self, index):
+        return self._open().read_enable(index)
+
+    def read_mode(self, index):
+        return self._open().read_mode(index)
+
+    def read_temp_sel(self, index):
+        return self._open().read_temp_sel(index)
+
+    def read_temp_sel_label(self, index):
+        return self._open().read_temp_sel_label(index)
+
+    def write_duty(self, index, duty):
+        return self._open().write_duty(index, duty)
+
+    def write_enable(self, index, enable):
+        return self._open().write_enable(index, enable)
+
+    def close(self):
+        if self.backend is not None:
+            self.backend.close()
+            self.backend = None
+
+    def as_dict(self):
+        return self.identity.to_dict()
+
+    def __str__(self):
+        return self.name
+
+
+def refresh_hardware_identity(log=None, force=False, include_superio=None):
+    """Collect active IDs and select a raw fallback when hwmon is empty."""
+    global _HARDWARE_INVENTORY, _ACTIVE_CONTROLLER
+    current, _name, _profile = hwmon_controller()
+    if include_superio is None:
+        include_superio = current is None
+    if (_HARDWARE_INVENTORY is not None and not force
+            and not include_superio
+            and not (current is None and _ACTIVE_CONTROLLER is None)):
+        return _HARDWARE_INVENTORY
+
+    close_active_controller()
+    inventory = hardwareid.identify_hardware(include_superio=include_superio)
+    _HARDWARE_INVENTORY = inventory
+    identity = hardwareid.select_controller(inventory)
+    _ACTIVE_CONTROLLER = None
+    if identity is not None:
+        profile = profile_by_key(identity.profile_key)
+        if profile is not None:
+            _ACTIVE_CONTROLLER = RawControllerSource(identity, profile)
+            if log:
+                log("active hardware identification: %s %s at %s"
+                    % (identity.vendor, identity.model,
+                       identity.io_base or "unknown I/O"))
+    problems = inventory.get("superio", {}).get("problems") or []
+    if log:
+        for problem in problems:
+            log("hardware probe: %s" % problem)
+        conflicts = kernel_conflict_lines()
+        for line in conflicts:
+            log("kernel SuperIO resource conflict: %s" % line)
+        if conflicts:
+            log("kernel SuperIO conflicts detected; raw-superio control will "
+                "reassert manual mode periodically (at least every 30s)")
+    return inventory
+
+
+def hardware_identity():
+    return _ACTIVE_CONTROLLER
+
+
+def hardware_inventory():
+    if _HARDWARE_INVENTORY is None:
+        refresh_hardware_identity()
+    return hardwareid.public_inventory(_HARDWARE_INVENTORY)
+
+
+def close_active_controller():
+    global _ACTIVE_CONTROLLER
+    if _ACTIVE_CONTROLLER is not None:
+        try:
+            _ACTIVE_CONTROLLER.close()
+        except OSError:
+            pass
+        _ACTIVE_CONTROLLER = None
+
+
+def reset_hardware_identity():
+    """Forget both the active controller and the cached inventory snapshot."""
+    global _HARDWARE_INVENTORY
+    close_active_controller()
+    _HARDWARE_INVENTORY = None
+
+
+def find_controller(preference="auto"):
+    """Locate the fan controller.
+
+    Returns ``(hwmon_path, chip_name, profile)``, or ``(None, None, None)``.
+    A known chip always wins over the generic fallback, so a supported board is
+    never driven with the wrong ``pwm_enable`` convention.
+    """
+    if preference not in ("auto", "fnos", "software"):
+        preference = "auto"
+    path, name, profile = hwmon_controller()
+    if preference in ("auto", "fnos") and path is not None:
+        return path, name, profile
+    if preference == "fnos":
+        return None, None, None
+    refresh_hardware_identity(
+        force=preference == "software",
+        include_superio=preference == "software" or path is None)
+    if _ACTIVE_CONTROLLER is not None and (
+            preference == "software" or _ACTIVE_CONTROLLER.controllable):
+        return (_ACTIVE_CONTROLLER, _ACTIVE_CONTROLLER.identity.model,
+                _ACTIVE_CONTROLLER.profile)
     return None, None, None
 
 
@@ -269,12 +482,13 @@ def find_superio():
 # --------------------------------------------------------------------------- #
 
 
-def load_module(name, log=None):
+def load_module(name, log=None, options=()):
     """Best effort ``modprobe``. Returns True when the module loaded."""
     if shutil.which("modprobe") is None:
         return False
     try:
-        proc = subprocess.run(["modprobe", name], capture_output=True,
+        command = ["modprobe", name] + list(options)
+        proc = subprocess.run(command, capture_output=True,
                               timeout=60, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         if log:
@@ -287,7 +501,7 @@ def load_module(name, log=None):
     return proc.returncode == 0
 
 
-def ensure_modules(log=None):
+def ensure_modules(log=None, preference="auto"):
     """Load whichever fan controller (and disk temperature) drivers we can.
 
     Loading a driver that finds no chip is harmless, and it is the only way to
@@ -295,13 +509,32 @@ def ensure_modules(log=None):
     so without this a supported board looks identical to an unsupported one.
     """
     notes = []
-    if find_controller()[0] is None:
+    if preference == "software":
+        refresh_hardware_identity(log, force=True, include_superio=True)
+        load_module("drivetemp", log)
+        return notes
+    if hwmon_controller()[0] is None:
+        refresh_hardware_identity(log)
+        resource_conflicts = [
+            line for line in kernel_conflict_lines()
+            if re.search(r"ACPI|resource|region|conflict|busy|already in use",
+                         line, re.I)
+        ]
         for module in CANDIDATE_MODULES:
             if os.path.isdir("/sys/module/%s" % module):
                 continue
-            if load_module(module, log):
+            loaded = load_module(module, log)
+            if not loaded and module == "it87" and resource_conflicts:
+                if log:
+                    log("retrying it87 with ignore_resource_conflict=1")
+                loaded = load_module(
+                    module, log, ("ignore_resource_conflict=1",))
+            if loaded:
                 notes.append(module)
-                if find_controller()[0] is not None:
+                candidate = find_controller(preference)[0]
+                if (candidate is not None
+                        and not (isinstance(candidate, RawControllerSource)
+                                 and not candidate.controllable)):
                     break
     load_module("drivetemp", log)
     return notes
@@ -315,10 +548,11 @@ def ensure_modules(log=None):
 class FanChannel:
     """One PWM-capable fan header."""
 
-    def __init__(self, hwmon, index, profile):
+    def __init__(self, hwmon, index, profile, transport=None):
         self.hwmon = hwmon
         self.index = index
         self.profile = profile
+        self.transport = transport
         self.path_rpm = os.path.join(hwmon, "fan%d_input" % index)
         self.path_pwm = os.path.join(hwmon, "pwm%d" % index)
         self.path_enable = os.path.join(hwmon, "pwm%d_enable" % index)
@@ -332,7 +566,8 @@ class FanChannel:
 
     @property
     def rpm(self):
-        value = read_int(self.path_rpm)
+        value = (self.transport.read_rpm(self.index)
+                 if self.transport is not None else read_int(self.path_rpm))
         if value is None:
             return None
         if value > self.peak_rpm:
@@ -344,10 +579,14 @@ class FanChannel:
     @property
     def duty(self):
         """Current PWM duty 0-255 as reported by the chip."""
+        if self.transport is not None:
+            return self.transport.read_duty(self.index)
         return read_int(self.path_pwm)
 
     @property
     def enable(self):
+        if self.transport is not None:
+            return self.transport.read_enable(self.index)
         return read_int(self.path_enable)
 
     @property
@@ -363,11 +602,15 @@ class FanChannel:
         which is one of the most common reasons a fan spins but cannot be
         regulated -- so it is worth surfacing.
         """
+        if self.transport is not None:
+            return self.transport.read_mode(self.index)
         return read_int(self.path_mode)
 
     @property
     def temp_sel(self):
         """Temperature source index the BIOS bound to this header."""
+        if self.transport is not None:
+            return self.transport.read_temp_sel(self.index)
         return read_int(self.path_temp_sel)
 
     @property
@@ -382,11 +625,14 @@ class FanChannel:
         selector = self.temp_sel
         if selector is None:
             return None
+        if self.transport is not None:
+            return self.transport.read_temp_sel_label(self.index)
         return read_text(os.path.join(self.hwmon, "temp%d_label" % selector))
 
     @property
     def controllable(self):
-        return self.profile.controllable
+        return bool(self.profile.controllable
+                    and (self.transport is None or self.transport.controllable))
 
     def as_dict(self):
         return {
@@ -409,12 +655,24 @@ class FanChannel:
     def set_manual(self, duty):
         """Drive the header from the manual PWM register."""
         duty = max(0, min(255, int(duty)))
-        write_text(self.path_enable, self.profile.manual)
-        write_text(self.path_pwm, duty)
+        self.write_enable(self.profile.manual)
+        self.write_duty(duty)
 
     def set_auto(self):
         """Select the chip's own automatic fan curve, if the driver has one."""
-        write_text(self.path_enable, self.profile.auto)
+        self.write_enable(self.profile.auto)
+
+    def write_enable(self, value):
+        if self.transport is not None:
+            self.transport.write_enable(self.index, value)
+        else:
+            write_text(self.path_enable, value)
+
+    def write_duty(self, value):
+        if self.transport is not None:
+            self.transport.write_duty(self.index, value)
+        else:
+            write_text(self.path_pwm, value)
 
 
 def fan_channels(profile=None, hwmon=None):
@@ -425,6 +683,18 @@ def fan_channels(profile=None, hwmon=None):
             profile = detected
     if hwmon is None or profile is None:
         return []
+
+    if isinstance(hwmon, RawControllerSource):
+        if not hwmon.controllable:
+            return []
+        indices = hwmon.identity.pwm_indices
+        if indices is None:
+            indices = tuple(range(hwmon.identity.pwm_count))
+        channels = [
+            FanChannel(hwmon.name, index + 1, profile, transport=hwmon)
+            for index in indices
+        ]
+        return channels
 
     indices = set()
     for path in glob.glob(os.path.join(hwmon, "fan*_input")):
@@ -466,9 +736,9 @@ def restore_channel(channel, snapshot=None, log=None):
     if snapshot is not None:
         enable, duty = snapshot
         if duty is not None:
-            write_text(channel.path_pwm, max(0, min(255, int(duty))))
+            channel.write_duty(max(0, min(255, int(duty))))
         if enable is not None:
-            write_text(channel.path_enable, int(enable))
+            channel.write_enable(int(enable))
             return "enable=%s duty=%s" % (enable, duty)
     try:
         channel.set_auto()
@@ -478,8 +748,8 @@ def restore_channel(channel, snapshot=None, log=None):
         if log:
             log("fan%d: automatic mode unavailable (%s), using full speed instead"
                 % (channel.index, exc))
-    write_text(channel.path_enable, channel.profile.manual)
-    write_text(channel.path_pwm, 255)
+    channel.write_enable(channel.profile.manual)
+    channel.write_duty(255)
     return "full speed (last resort)"
 
 
@@ -542,6 +812,12 @@ def diagnose_unresponsive(channel, entry):
             "写 pwm%d_enable=%s 被驱动拒绝，芯片没能进入手动模式，仍由 BIOS 的"
             "自动曲线控制 —— 这种情况下写占空比不会有任何效果。"
             % (index, channel.profile.manual))
+    elif (entry.get("enable_readback") is not None
+          and entry["enable_readback"] != channel.profile.manual):
+        hints.append(
+            "写入手动模式后立即读回 enable=%s，而不是 %s："
+            "BIOS/EC 可能锁定了该通道，或该芯片还需要额外的控制解锁。"
+            % (entry["enable_readback"], channel.profile.manual))
     elif entry.get("pwm_writable") is False:
         hints.append("写 pwm%d 被驱动拒绝（权限或驱动不支持）。" % index)
     elif readback is not None and high is not None and readback != high:
@@ -555,9 +831,17 @@ def diagnose_unresponsive(channel, entry):
             "也可能是该接头的 PWM 针脚没有实际接到插座。"
             "换一个接头、或换一把 4 针 PWM 风扇即可确认。")
 
-    hints.append(
-        "还要确认 BIOS 没有锁死风扇控制：部分主板（尤其 ASUS）会周期性重新接管 "
-        "SuperIO，可以查 dmesg 里有没有 ACPI resource conflict。")
+    conflicts = kernel_conflict_lines()
+    if conflicts:
+        hints.append(
+            "内核日志中发现 ACPI / SuperIO 资源冲突：%s。"
+            "当前软件驱动会在控制循环中周期性重新写入手动模式；"
+            "如果仍然无法调速，请把这条冲突和当前控制器信息一起反馈。"
+            % "；".join(conflicts))
+    else:
+        hints.append(
+            "还要确认 BIOS 没有锁死风扇控制：部分主板（尤其 ASUS）会周期性重新接管 "
+            "SuperIO，可以查 dmesg 里有没有 ACPI resource conflict。")
     return hints
 
 
@@ -610,6 +894,7 @@ def probe_channels(channels, log=None, low_duty=PROBE_LOW_DUTY,
             "pwm_writable": None,
             "pwm_readback": None,
             "enable_writable": None,
+            "enable_readback": None,
             "hints": [],
             "error": None,
         }
@@ -617,13 +902,14 @@ def probe_channels(channels, log=None, low_duty=PROBE_LOW_DUTY,
             try:
                 # point 1: full speed, capturing whether each write is accepted
                 try:
-                    write_text(channel.path_enable, channel.profile.manual)
+                    channel.write_enable(channel.profile.manual)
                     entry["enable_writable"] = True
+                    entry["enable_readback"] = channel.enable
                 except OSError as exc:
                     entry["enable_writable"] = False
                     entry["error"] = str(exc)
                 try:
-                    write_text(channel.path_pwm, high_duty)
+                    channel.write_duty(high_duty)
                     entry["pwm_writable"] = True
                     entry["pwm_readback"] = channel.duty
                 except OSError as exc:
@@ -636,7 +922,7 @@ def probe_channels(channels, log=None, low_duty=PROBE_LOW_DUTY,
                 # point 2: only worth doing when something actually spins
                 if entry["rpm_high"]:
                     try:
-                        write_text(channel.path_pwm, low_duty)
+                        channel.write_duty(low_duty)
                     except OSError:
                         pass
                     time.sleep(low_settle)
@@ -782,7 +1068,7 @@ def read_cpu():
             return value / 1000.0, "x86_pkg_temp (thermal zone)"
 
     hwmon = find_controller()[0]
-    if hwmon:
+    if isinstance(hwmon, str) and hwmon.startswith("/sys/"):
         for path in glob.glob(os.path.join(hwmon, "temp*_label")):
             if "peci agent 0" not in (read_text(path) or "").lower():
                 continue

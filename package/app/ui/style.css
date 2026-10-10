@@ -374,6 +374,32 @@ input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
 }
 .modal-note { margin-right: auto; font-size: 12px; color: var(--muted); }
 
+/* "No controllable fan controller" banner at the top of the detection dialog.
+   It has to be readable at a glance, but it must not block the table below:
+   the dialog is still the place where the user inspects what *was* detected. */
+.diag-warn {
+  margin: 14px 20px 0;
+  padding: 12px 14px;
+  border: 2px solid color-mix(in srgb, var(--err) 42%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+.diag-warn p { margin: 0 0 6px; }
+.diag-warn p:last-of-type { margin-bottom: 0; }
+.diag-warn .diag-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-top: 10px;
+}
+.diag-warn .diag-hint { color: var(--muted); font-size: 11.5px; }
+.diag-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
+.feedback-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.feedback-links .btn { text-decoration: none; }
+
 .hw-card {
   display: flex;
   flex-wrap: wrap;
@@ -386,6 +412,13 @@ input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
 }
 .hw-item { font-size: 12px; color: var(--muted); }
 .hw-item b { display: block; margin-top: 2px; font-size: 13.5px; color: var(--text); font-weight: 600; }
+.driver-mode { min-width: 220px; }
+.driver-picker { display: flex; gap: 6px; margin: 5px 0 3px; }
+.driver-picker .driver-choice { padding: 4px 9px; font-size: 12px; }
+.driver-picker .driver-choice.on {
+  border-color: var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
 
 .chan-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .chan-table th {

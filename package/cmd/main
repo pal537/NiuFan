@@ -114,6 +114,7 @@ start_process() {
     nohup "$PYTHON" "$DAEMON" run \
         --appdest "$APPDEST" \
         --etc "$PKGETC" \
+        --var "$PKGVAR" \
         --socket "$SOCKET" \
         --ui "${APPDEST}/ui" \
         --require-admin \
