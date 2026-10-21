@@ -7,13 +7,23 @@
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-x86-lightgrey.svg)](#compatibility)
 [![fnOS](https://img.shields.io/badge/fnOS-%E2%89%A51.1.3100-green.svg)](https://www.fnnas.com/)
-[![Version](https://img.shields.io/badge/version-2.2.5-orange.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.7-orange.svg)](CHANGELOG.md)
 
 [简体中文](README.md) · [English](README.en.md)
 
 </div>
 
 ---
+
+> **This is a fork of [LiuFudi/NiuFan](https://github.com/LiuFudi/NiuFan).**
+> On top of upstream it adds fan control for **QNAP NAS** devices whose fans are
+> managed by an ITE IT8528 EC, using the open-source
+> [qnap8528](https://github.com/0xGiddi/qnap8528) kernel driver (vendored under
+> `qnap8528/` with its own attribution). Supported-model statement: the driver
+> config table covers 100+ QNAP models and they will *likely* work, but this is
+> **not guaranteed** — only the **TS-564** has been fully tested by this fork.
+> See the Chinese README for the full QNAP section. This project is not
+> affiliated with QNAP Systems, Inc.
 
 ## Why
 
