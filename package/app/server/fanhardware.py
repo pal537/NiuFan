@@ -72,10 +72,11 @@ class ControllerProfile:
     """What we need to know about one fan-controller driver family."""
 
     __slots__ = ("key", "label", "prefixes", "manual", "auto", "controllable",
-                 "modules", "note", "tested")
+                 "modules", "note", "tested", "enable_absent")
 
     def __init__(self, key, label, prefixes, manual=1, auto=2,
-                 controllable=True, modules=(), note="", tested=False):
+                 controllable=True, modules=(), note="", tested=False,
+                 enable_absent=False):
         self.key = key
         self.label = label
         self.prefixes = tuple(prefixes)
@@ -85,6 +86,10 @@ class ControllerProfile:
         self.modules = tuple(modules)
         self.note = note
         self.tested = tested
+        # True when the driver exposes pwmN but no pwmN_enable at all: the
+        # channel is effectively always in manual mode while the driver is
+        # loaded, and handing control back means unloading that driver.
+        self.enable_absent = enable_absent
 
     def as_dict(self):
         return {
@@ -95,6 +100,7 @@ class ControllerProfile:
             "controllable": self.controllable,
             "tested": self.tested,
             "note": self.note,
+            "enable_absent": self.enable_absent,
         }
 
 
@@ -178,6 +184,20 @@ PROFILES = (
         prefixes=("sch5627", "sch5636"),
         manual=1, auto=2,
         modules=("sch5627", "sch5636"),
+    ),
+    ControllerProfile(
+        key="qnap8528",
+        label="QNAP ITE IT8528 EC（威联通 NAS）",
+        prefixes=("qnap8528",),
+        manual=1, auto=2,
+        modules=(),
+        enable_absent=True,
+        tested=True,
+        note="威联通 NAS 的风扇由 ITE IT8528 EC 管理，需要 qnap8528 内核模块。"
+             "该模块由本应用自带并在启动时从应用目录加载（不写入系统模块目录），"
+             "停止应用时卸载，EC 随即恢复固件自身的风扇策略。"
+             "该驱动不提供 pwmN_enable：模块加载期间通道恒为手动模式，"
+             "写入 pwmN 即设定转速。",
     ),
 )
 
@@ -457,6 +477,11 @@ def find_controller(preference="auto"):
     if preference not in ("auto", "fnos", "software"):
         preference = "auto"
     path, name, profile = hwmon_controller()
+    if name == "qnap8528" and path is not None:
+        # The IT8528 EC is only reachable through its hwmon driver; the raw
+        # SuperIO backend cannot speak to it, so the driver-mode preference
+        # does not apply to this controller.
+        return path, name, profile
     if preference in ("auto", "fnos") and path is not None:
         return path, name, profile
     if preference == "fnos":
@@ -501,6 +526,104 @@ def load_module(name, log=None, options=()):
     return proc.returncode == 0
 
 
+# --------------------------------------------------------------------------- #
+# bundled qnap8528 module (QNAP ITE IT8528 EC)
+# --------------------------------------------------------------------------- #
+
+#: The qnap8528 driver is not part of the kernel, so this app carries the
+#: compiled module for the running kernel inside its own install directory
+#: and loads it from there.  Nothing is ever written to the system module
+#: directories.  A marker file next to the .ko records that *this app*
+#: loaded the module, so the matching unload only ever removes a module the
+#: app itself put there -- a module the user loaded by hand is left alone.
+_BUNDLED_MODULE_NAME = "qnap8528"
+
+
+def _bundled_driver_dir():
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "driver")
+
+
+def _bundled_module_file():
+    return os.path.join(_bundled_driver_dir(),
+                        "qnap8528-%s.ko" % os.uname().release)
+
+
+def _bundled_marker_file():
+    return os.path.join(_bundled_driver_dir(), ".qnap8528-loaded-by-niufan")
+
+
+def _qnap8528_present():
+    for path in glob.glob("/sys/class/hwmon/hwmon*/name"):
+        try:
+            with open(path) as handle:
+                if handle.read().strip() == _BUNDLED_MODULE_NAME:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def ensure_bundled_qnap8528(log=None):
+    """Load the app-bundled qnap8528 module when the EC is not exposed yet."""
+    if _qnap8528_present():
+        return True
+    module_file = _bundled_module_file()
+    if not os.path.isfile(module_file):
+        if log:
+            log("qnap8528: no bundled module for kernel %s"
+                % os.uname().release)
+        return False
+    insmod = shutil.which("insmod") or "/sbin/insmod"
+    try:
+        proc = subprocess.run(
+            [insmod, module_file, "skip_hw_check=true"],
+            capture_output=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        if log:
+            log("qnap8528: insmod failed: %s" % (exc,))
+        return False
+    if proc.returncode != 0:
+        if log:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            log("qnap8528: insmod rc=%s %s" % (proc.returncode, detail))
+        return False
+    try:
+        with open(_bundled_marker_file(), "w") as handle:
+            handle.write(os.uname().release)
+    except OSError:
+        pass
+    if log:
+        log("qnap8528: bundled module loaded (%s)" % module_file)
+    return _qnap8528_present()
+
+
+def release_bundled_qnap8528(log=None):
+    """Unload the bundled module, but only if this app loaded it."""
+    if not os.path.isfile(_bundled_marker_file()):
+        return False
+    rmmod = shutil.which("rmmod") or "/sbin/rmmod"
+    try:
+        proc = subprocess.run([rmmod, _BUNDLED_MODULE_NAME],
+                              capture_output=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        if log:
+            log("qnap8528: rmmod failed: %s" % (exc,))
+        return False
+    if proc.returncode != 0:
+        if log:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            log("qnap8528: rmmod rc=%s %s" % (proc.returncode, detail))
+        return False
+    try:
+        os.unlink(_bundled_marker_file())
+    except OSError:
+        pass
+    if log:
+        log("qnap8528: bundled module unloaded, EC firmware control resumed")
+    return True
+
+
 def ensure_modules(log=None, preference="auto"):
     """Load whichever fan controller (and disk temperature) drivers we can.
 
@@ -509,12 +632,19 @@ def ensure_modules(log=None, preference="auto"):
     so without this a supported board looks identical to an unsupported one.
     """
     notes = []
+    if ensure_bundled_qnap8528(log):
+        notes.append("qnap8528")
     if preference == "software":
         refresh_hardware_identity(log, force=True, include_superio=True)
         load_module("drivetemp", log)
         return notes
     if hwmon_controller()[0] is None:
         refresh_hardware_identity(log)
+        if ensure_bundled_qnap8528(log):
+            notes.append("qnap8528")
+            if find_controller(preference)[0] is not None:
+                load_module("drivetemp", log)
+                return notes
         resource_conflicts = [
             line for line in kernel_conflict_lines()
             if re.search(r"ACPI|resource|region|conflict|busy|already in use",
@@ -587,6 +717,10 @@ class FanChannel:
     def enable(self):
         if self.transport is not None:
             return self.transport.read_enable(self.index)
+        if self.profile.enable_absent:
+            # No pwmN_enable exists: while the driver is loaded the channel
+            # is permanently in manual mode.
+            return self.profile.manual
         return read_int(self.path_enable)
 
     @property
@@ -665,6 +799,11 @@ class FanChannel:
     def write_enable(self, value):
         if self.transport is not None:
             self.transport.write_enable(self.index, value)
+        elif self.profile.enable_absent:
+            # The driver has no pwmN_enable attribute; selecting modes is a
+            # no-op.  Handing the fan back happens by unloading the module
+            # (see release_bundled_qnap8528).
+            return
         else:
             write_text(self.path_enable, value)
 
@@ -765,6 +904,7 @@ def restore_all_to_auto(log=None):
         except OSError as exc:
             if log:
                 log("restore fan%d failed: %s" % (channel.index, exc))
+    release_bundled_qnap8528(log)
     return restored
 
 

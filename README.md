@@ -7,13 +7,20 @@
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-x86-lightgrey.svg)](#兼容性)
 [![fnOS](https://img.shields.io/badge/fnOS-%E2%89%A51.1.3100-green.svg)](https://www.fnnas.com/)
-[![Version](https://img.shields.io/badge/version-2.2.5-orange.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.7-orange.svg)](CHANGELOG.md)
 
 [简体中文](README.md) · [English](README.en.md)
 
 </div>
 
 ---
+
+> **本仓库是 [LiuFudi/NiuFan](https://github.com/LiuFudi/NiuFan) 的 Fork。**
+> 在上游全部功能的基础上，新增**威联通（QNAP）NAS 风扇控制支持**（基于开源驱动
+> [0xGiddi/qnap8528](https://github.com/0xGiddi/qnap8528)），详见下方
+> 「威联通 QNAP 机型支持（本 Fork 新增）」一节。上游本体版权归原作者所有，
+> 本 Fork 遵循同一 GPL-3.0 许可证；驱动部分版权归 0xGiddi 所有（GPL）。
+> 本项目与威联通公司（QNAP Systems, Inc.）无任何关联。
 
 ## 为什么做这个
 
@@ -196,6 +203,67 @@ ACPI / SuperIO 冲突记录。
 固件的寄存器布局与 Nuvoton 数据手册不符，**从操作系统写入任何值都被视为风险过高
 而禁用**（驱动根本不导出可写的 `pwmN`）。这类主板（ASRock B650/X670E、MSI B550/X670
 等）应用会识别出控制器并如实告诉你只能监控。
+
+## 威联通 QNAP 机型支持（本 Fork 新增）
+
+部分威联通 NAS 换装飞牛 OS 后没有风扇控制：它们的风扇由主板上的 **ITE IT8528 EC**
+芯片管理，飞牛内核没有与之对话的驱动，风扇只能按 EC 固件的出厂策略转。
+
+本 Fork 的做法（不修改飞牛系统文件，一切收在应用包内）：
+
+- 应用包自带开源内核驱动 **qnap8528**（作者 [0xGiddi](https://github.com/0xGiddi/qnap8528)，
+  源码在本仓库 `qnap8528/` 目录，文件头含其版权与 GPL 声明）编译出的模块
+  `app/driver/qnap8528-<内核版本>.ko`；
+- 应用启动时加载该模块，EC 的风扇转速 / PWM / 温度随即以标准 hwmon 接口出现，
+  由 NiuFan 按温度曲线统一调速；应用停止时卸载模块，风扇交还 EC 固件——
+  任何异常情况下都不会停转失控。
+
+### 支持口径（请务必读完）
+
+qnap8528 驱动的配置表覆盖**一百余款**威联通机型（主板码 + 背板码齐全，
+机器可被驱动自动识别）。据此我们如实声明：
+
+- **大概率可用，但不保证。** 驱动配置表所列机型理论上都能被识别并控制风扇；
+- **除 TS-564 外，均未经本项目测试。** 本项目仅在 **TS-564（飞牛 OS）** 上完成
+  完整实测：驱动加载、转速标定、温度曲线闭环调速、停启交还 EC 均验证通过；
+- 其他机型如需使用，请自行按下方说明编译与内核匹配的模块；可用与否欢迎回报，
+  机型配置层面的问题请同时反馈给上游驱动项目。
+
+### 机型一览（驱动配置表覆盖，含同型号不同主板版本）
+
+完整表格（含主板码 / 背板码）见本仓库 `qnap8528/README.md` 的
+*Supported Models* 一节（驱动项目原文）。型号名单如下：
+
+- **TS 桌面型**：TS-251A、TS-251D、TS-253A、TS-253B、TS-253BE、TS-253D、
+  TS-262、TS-262C、TS-264、TS-264C、TS-364、TS-451A、TS-451D、TS-451D2、
+  TS-453A、TS-453B、TS-453BE、TS-453D、TS-453DMINI、TS-453BMINI、TS-453MINI II、
+  TS-462、TS-462C、TS-464、TS-464C、TS-464C2、TS-464T4、TS-466C、
+  TS-473、TS-473A、TS-551、TS-553AS、**TS-564（本项目实测）**、TS-653A、TS-653B、
+  TS-653D、TS-664、TS-673、TS-673A、TS-686、TS-853A、TS-873、TS-873A、
+  TS-886、TS-973AX、TS-ALTO4、TBS-453A、TBS-453DX、TBS-464、HS-453DX、Qu605
+- **TVS 桌面型**：TVS-472X、TVS-472XT、TVS-474、TVS-473e、TVS-673e、TVS-873e、
+  TVS-672N、TVS-672X、TVS-672XT、TVS-674、TVS-675、TVS-872N、TVS-872X、
+  TVS-872XT、TVS-874、TVS-H674T、TVS-H874T、TVS-H674X、TVS-H874X、
+  TVS-951N、TVS-951X、TVS-1288X、TVS-1688X
+- **机架型**：TS-464U、TS-464EU、TS-864EU、TS-1264U、TS-655X、TS-855X、
+  TS-855EU、TS-873AEU、TS-873AEU-RP、TS-873AU、TS-873AU-RP、TS-1273AU、
+  TS-1273AU-RP、TS-1673AU-RP、TS-977XU、TS-983XU、TS-883XU、TS-1283XU、
+  TS-1683XU、TS-877XU、TS-1277XU、TS-1677XU、TS-2477XU、TS-2483XU、
+  TS-1090FU、TS-1290FX、TS-2490FU、TS-1655、TS-1685、TES-1685-SAS、
+  TS-1886XU、TS-1886XU R2、TS-1887XU、TS-2287XU、TS-2888X、TS-3087XU、
+  TS-3088XU、TES-1885U、TES-3085U、TVS-875U、TVS-1275U、TVS-1675U、
+  TNS-1083X、TNS-C1083X、TDS-2489FU、TDS-2489FU R2、BA-400、BA-600、BA-800
+
+注：部分机型（如 TS-464 系、TS-253D）需要以 `skip_hw_check=true` 加载模块，
+本 Fork 加载时恒带该参数，已覆盖。个别机型的部分硬盘 LED 由其他硬件管理
+（与风扇无关），细节见驱动原文。
+
+### 内核版本与模块重编
+
+`.ko` 与内核版本严格绑定。安装包自带的模块对应飞牛内核
+**6.18.18.c1126-trim**；飞牛升级内核后，风扇会自动回落 EC 出厂策略（安全），
+按仓库 `REBUILD.md` 用新内核头文件重编模块、放入 `app/driver/` 即可恢复，
+全过程约十分钟，不动宿主机环境。
 
 ## 从源码构建
 

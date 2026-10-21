@@ -53,7 +53,7 @@ APP_TITLE = "NiuFan"
 LEGACY_APP_NAME = "fn-fancontrol"
 # Must be kept in step with the ``version`` field of the package manifest:
 # the app center does not export TRIM_APPVER to the daemon.
-VERSION = "2.2.5"
+VERSION = "2.2.7"
 
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -731,6 +731,7 @@ class Controller:
         if not managed:
             self.log("no channel was under control, nothing to restore")
             fanhardware.close_active_controller()
+            fanhardware.release_bundled_qnap8528(self.log)
             return
         restored = []
         for index in managed:
@@ -749,6 +750,7 @@ class Controller:
         self.duty_mismatch_at.clear()
         self.log("handed channel(s) back: %s" % (", ".join(restored),))
         fanhardware.close_active_controller()
+        fanhardware.release_bundled_qnap8528(self.log)
 
     # -- first-run detection ----------------------------------------------- #
 
